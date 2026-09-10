@@ -1,12 +1,62 @@
 {
-  "enabled": {"type": "bool", "default": false, "description": "启用知识沉淀"},
-  "platform_ids": {"type": "list", "default": [], "description": "平台实例 ID；空表示不额外限制"},
-  "group_ids": {"type": "list", "default": [], "description": "启用的飞书群 ID；空表示不开启群聊"},
-  "private_ids": {"type": "list", "default": [], "description": "启用的飞书私聊用户 ID；空表示不开启私聊"},
-  "writer_ids": {"type": "list", "default": [], "description": "允许写入的用户 ID；空表示已启用会话内全部成员"},
-  "template_kb": {"type": "string", "default": "", "description": "已有知识库名称或 ID；新项目复用其模型与分块配置，不复制其文档"},
-  "project_shares_json": {"type": "text", "default": "{}", "description": "跨会话共享权限 JSON：项目名对应会话范围列表。范围从 /知识管理状态 获取；仅用于权限，不决定项目归属"},
-  "max_topic_chars": {"type": "int", "default": 100000, "description": "话题历史字符上限；超出明确失败，不静默截断"},
-  "max_index_chunks": {"type": "int", "default": 5000, "description": "每项目索引块上限，保证过滤旧版本后仍有完整候选"},
-  "review_timeout": {"type": "int", "default": 120, "description": "写入校验模型超时秒数"}
+  "enabled": {
+    "type": "bool",
+    "default": false,
+    "description": "启用知识沉淀",
+    "hint": "开启后，还需在下方填写允许使用的群聊或私聊，并配置知识库模板。"
+  },
+  "platform_ids": {
+    "type": "list",
+    "default": [],
+    "description": "平台实例范围",
+    "hint": "填写 AstrBot 平台实例 ID，不是飞书 App ID。留空表示不额外限制平台实例。"
+  },
+  "group_ids": {
+    "type": "list",
+    "default": [],
+    "description": "启用的群聊",
+    "hint": "填写飞书群 ID（oc_ 开头），每项一个。留空表示不启用群聊。"
+  },
+  "private_ids": {
+    "type": "list",
+    "default": [],
+    "description": "启用的私聊",
+    "hint": "填写飞书用户 Open ID（ou_ 开头），每项一个。留空表示不启用私聊。"
+  },
+  "writer_ids": {
+    "type": "list",
+    "default": [],
+    "description": "允许写入的用户",
+    "hint": "填写飞书用户 Open ID，每项一个。留空表示已启用会话内的全部成员均可写入。"
+  },
+  "template_kb": {
+    "type": "string",
+    "default": "",
+    "description": "知识库模板",
+    "hint": "填写已有知识库的名称或 ID。新项目复用它的嵌入模型、重排序模型和分块配置，不复制原有文档。"
+  },
+  "project_shares_json": {
+    "type": "text",
+    "default": "{}",
+    "description": "跨会话共享权限",
+    "hint": "填写 JSON 对象：项目名对应允许访问的会话范围列表。会话范围通过 /知识管理状态 获取。此配置只控制访问权限，不决定话题所属项目；修改后需重新加载插件。"
+  },
+  "max_topic_chars": {
+    "type": "int",
+    "default": 100000,
+    "description": "话题历史上限（字符）",
+    "hint": "默认 100000 字符。超过上限会明确提示失败，不会静默截断话题后保存。"
+  },
+  "max_index_chunks": {
+    "type": "int",
+    "default": 5000,
+    "description": "项目索引上限（块）",
+    "hint": "默认每项目 5000 块。在上限内获取完整检索候选，过滤旧版本和其他平台的内容。超过上限需清理历史索引或调整此值。"
+  },
+  "review_timeout": {
+    "type": "int",
+    "default": 120,
+    "description": "写入校验超时（秒）",
+    "hint": "默认 120 秒。使用当前聊天模型校验保存意图和内容；超时不会确认保存成功。"
+  }
 }
