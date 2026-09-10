@@ -11,6 +11,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
 from .backend import AstrBotBackend
+from .directory import ChoiceDirectory, normalize_config
 from .models import KnowledgeError, Plan, TopicContext, text
 from .prompts import REVIEW, SYSTEM
 from .service import Service
@@ -37,6 +38,7 @@ def scope_of(event):
 class SummaryWriteKnowledgeSkill(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        normalize_config(config)
         self.config = config
         try:
             shares = json.loads(config.get("project_shares_json", "{}"))
@@ -56,8 +58,12 @@ class SummaryWriteKnowledgeSkill(Star):
         service_config["project_shares"] = shares
         self.store = Store(StarTools.get_data_dir("astrbot_plugin_summary_write_knowledge_skill"))
         self.service = Service(self.store, AstrBotBackend(context, service_config), service_config)
+        self.directory = ChoiceDirectory(context, config, self.store.root / "directory.json")
         self.closed = False
         self.active = set()
+
+    async def initialize(self):
+        await self.directory.start()
 
     def enabled(self, event):
         if self.closed or not self.config.get("enabled", False):
@@ -100,6 +106,7 @@ class SummaryWriteKnowledgeSkill(Star):
 
     @filter.on_llm_request(priority=-20000)
     async def prepare(self, event: AstrMessageEvent, req):
+        self.directory.observe(event)
         event.set_extra(SNAPSHOT, None)
         event.set_extra("summary_knowledge.context_read", False)
         if not self.enabled(event):
@@ -314,6 +321,7 @@ class SummaryWriteKnowledgeSkill(Star):
 
     async def terminate(self):
         self.closed = True
+        await self.directory.close()
         tasks = [t for t in self.active if t is not asyncio.current_task()]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)

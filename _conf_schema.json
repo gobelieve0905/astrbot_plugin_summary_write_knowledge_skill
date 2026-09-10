@@ -9,31 +9,41 @@
     "type": "list",
     "default": [],
     "description": "平台实例范围",
-    "hint": "填写 AstrBot 平台实例 ID，不是飞书 App ID。留空表示不额外限制平台实例。"
+    "hint": "选择平台实例，实际保存 ID。留空表示全部平台实例。",
+    "options": [],
+    "labels": []
   },
   "group_ids": {
     "type": "list",
     "default": [],
     "description": "启用的群聊",
-    "hint": "留空表示启用全部群聊；填写后仅启用指定群聊。填写飞书群 ID（oc_ 开头），每项一个。"
+    "hint": "选择机器人可见或已知的群聊，实际保存群 ID。留空表示全部群聊。",
+    "options": [],
+    "labels": []
   },
   "private_ids": {
     "type": "list",
     "default": [],
     "description": "启用的私聊",
-    "hint": "留空表示启用全部私聊；填写后仅启用指定用户的私聊。填写飞书用户 Open ID（ou_ 开头），每项一个。"
+    "hint": "选择可见群成员或已知用户，实际保存 Open ID。留空表示全部私聊。",
+    "options": [],
+    "labels": []
   },
   "writer_ids": {
     "type": "list",
     "default": [],
     "description": "允许写入的用户",
-    "hint": "填写飞书用户 Open ID，每项一个。留空表示已启用会话内的全部成员均可写入。"
+    "hint": "选择允许写入的用户，实际保存 Open ID。留空表示已启用会话内全部成员。",
+    "options": [],
+    "labels": []
   },
   "template_kb": {
-    "type": "text",
-    "default": "",
+    "type": "list",
+    "default": [],
     "description": "可用知识库",
-    "hint": "留空表示所有知识库都可用；填写后仅使用指定库，名称或 ID 每行一个。Agent 根据当前话题选择项目和目标库，不会同时写入全部库；已有项目仍遵守共享权限。"
+    "hint": "选择可用知识库，实际保存库 ID。留空表示全部知识库，仍按话题选择目标库。",
+    "options": [],
+    "labels": []
   },
   "project_shares_json": {
     "type": "text",

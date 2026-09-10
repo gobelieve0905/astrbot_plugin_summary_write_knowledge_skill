@@ -146,6 +146,6 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
             await self.backend.ensure(self.project, plan())
 
     async def test_invalid_config_is_not_treated_as_all(self):
-        self.config["template_kb"] = []
+        self.config["template_kb"] = {}
         with self.assertRaises(models.KnowledgeError):
             await self.backend.catalog()

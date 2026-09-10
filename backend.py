@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+from .directory import selections
 from .models import KnowledgeError
 
 
@@ -13,11 +14,7 @@ class AstrBotBackend:
         self.config = config
 
     def configured_names(self):
-        # Keep the existing string key for config compatibility; one name/ID per line.
-        raw = self.config.get("template_kb", "")
-        if not isinstance(raw, str):
-            raise KnowledgeError("可用知识库应填写名称或 ID，每行一个；留空表示全部。")
-        return {line.strip() for line in raw.splitlines() if line.strip()}
+        return set(selections(self.config.get("template_kb", []), legacy_text=True))
 
     def selected(self, kb):
         names = self.configured_names()
