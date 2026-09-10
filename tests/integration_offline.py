@@ -111,6 +111,33 @@ async def main():
         evt.send = AsyncMock(side_effect=AssertionError("No messages may be sent"))
         return evt
 
+    # Empty lists enable all peers; populated lists restrict only their own scope.
+    group_peer = types.SimpleNamespace(
+        get_group_id=lambda: "other-group",
+        get_sender_id=lambda: "other-user",
+        get_platform_id=lambda: "instance",
+    )
+    private_peer = types.SimpleNamespace(
+        get_group_id=lambda: "",
+        get_sender_id=lambda: "other-user",
+        get_platform_id=lambda: "instance",
+    )
+    assert not plugin.enabled(group_peer)
+    config["group_ids"] = []
+    assert plugin.enabled(group_peer) and plugin.enabled(private_peer)
+    config["private_ids"] = ["allowed-user"]
+    assert plugin.enabled(group_peer) and not plugin.enabled(private_peer)
+    config["private_ids"] = ["other-user"]
+    assert plugin.enabled(private_peer)
+    config["platform_ids"] = ["different-instance"]
+    assert not plugin.enabled(group_peer) and not plugin.enabled(private_peer)
+    config["platform_ids"] = []
+    config["enabled"] = False
+    assert not plugin.enabled(group_peer) and not plugin.enabled(private_peer)
+    config["enabled"] = True
+    config["group_ids"] = ["oc_test"]
+    config["private_ids"] = []
+
     evt = event("q1")
     cid = await conversations.new_conversation(evt.unified_msg_origin, evt.get_platform_id())
     owner = evt.unified_msg_origin

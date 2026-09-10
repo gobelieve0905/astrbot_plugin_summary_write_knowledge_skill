@@ -66,11 +66,9 @@ class SummaryWriteKnowledgeSkill(Star):
         if platforms and event.get_platform_id() not in platforms:
             return False
         group = event.get_group_id()
-        return (
-            group in self.config.get("group_ids", [])
-            if group
-            else event.get_sender_id() in self.config.get("private_ids", [])
-        )
+        allowed = self.config.get("group_ids" if group else "private_ids", [])
+        peer = group or event.get_sender_id()
+        return not allowed or peer in allowed
 
     def guard(self, event, write=False):
         from astrbot import __version__

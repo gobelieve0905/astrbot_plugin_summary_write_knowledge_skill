@@ -3,7 +3,7 @@
     "type": "bool",
     "default": false,
     "description": "启用知识沉淀",
-    "hint": "开启后，还需在下方填写允许使用的群聊或私聊，并配置知识库模板。"
+    "hint": "开启后，群聊和私聊列表留空表示全部启用；填写列表则仅启用指定会话。新建项目资料前需配置知识库模板。"
   },
   "platform_ids": {
     "type": "list",
@@ -15,13 +15,13 @@
     "type": "list",
     "default": [],
     "description": "启用的群聊",
-    "hint": "填写飞书群 ID（oc_ 开头），每项一个。留空表示不启用群聊。"
+    "hint": "留空表示启用全部群聊；填写后仅启用指定群聊。填写飞书群 ID（oc_ 开头），每项一个。"
   },
   "private_ids": {
     "type": "list",
     "default": [],
     "description": "启用的私聊",
-    "hint": "填写飞书用户 Open ID（ou_ 开头），每项一个。留空表示不启用私聊。"
+    "hint": "留空表示启用全部私聊；填写后仅启用指定用户的私聊。填写飞书用户 Open ID（ou_ 开头），每项一个。"
   },
   "writer_ids": {
     "type": "list",
