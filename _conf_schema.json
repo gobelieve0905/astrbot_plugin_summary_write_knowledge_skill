@@ -1,0 +1,12 @@
+{
+  "enabled": {"type": "bool", "default": false, "description": "启用知识沉淀"},
+  "platform_ids": {"type": "list", "default": [], "description": "平台实例 ID；空表示不额外限制"},
+  "group_ids": {"type": "list", "default": [], "description": "启用的飞书群 ID；空表示不开启群聊"},
+  "private_ids": {"type": "list", "default": [], "description": "启用的飞书私聊用户 ID；空表示不开启私聊"},
+  "writer_ids": {"type": "list", "default": [], "description": "允许写入的用户 ID；空表示已启用会话内全部成员"},
+  "template_kb": {"type": "string", "default": "", "description": "已有知识库名称或 ID；新项目复用其模型与分块配置，不复制其文档"},
+  "project_shares_json": {"type": "text", "default": "{}", "description": "跨会话共享权限 JSON：项目名对应会话范围列表。范围从 /知识管理状态 获取；仅用于权限，不决定项目归属"},
+  "max_topic_chars": {"type": "int", "default": 100000, "description": "话题历史字符上限；超出明确失败，不静默截断"},
+  "max_index_chunks": {"type": "int", "default": 5000, "description": "每项目索引块上限，保证过滤旧版本后仍有完整候选"},
+  "review_timeout": {"type": "int", "default": 120, "description": "写入校验模型超时秒数"}
+}

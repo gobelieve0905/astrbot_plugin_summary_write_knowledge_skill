@@ -1,0 +1,6 @@
+/AGENTS.md export-ignore
+/docs/ export-ignore
+/tests/ export-ignore
+/pyproject.toml export-ignore
+/.gitignore export-ignore
+/.gitattributes export-ignore
