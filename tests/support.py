@@ -19,8 +19,13 @@ class Backend:
         self.fail_delete = False
         self.helper = types.SimpleNamespace(kb=types.SimpleNamespace(kb_id="kb-test"))
 
-    async def ensure(self, project):
+    async def ensure(self, project, **kwargs):
         return self.helper
+
+    async def catalog(self, blocked_ids=()):
+        return (
+            [{"id": "kb-test", "name": "Test model config"}] if "kb-test" not in blocked_ids else []
+        )
 
     async def upload(self, helper, filename, body):
         if filename not in self.docs:

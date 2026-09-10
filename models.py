@@ -60,6 +60,8 @@ class Plan:
     expected_version: int = 0
     create_project: bool = False
     effective_at: str = ""
+    knowledge_base: str = ""
+    model_source: str = ""
 
     @classmethod
     def parse(cls, raw):
@@ -95,6 +97,11 @@ class Plan:
                 raise KnowledgeError(
                     "生效时间必须带时区且不晚于当前时间；暂不支持预约生效。"
                 ) from None
+        for field in ("knowledge_base", "model_source"):
+            value = raw.get(field, "")
+            if not isinstance(value, str):
+                raise KnowledgeError(f"{field} 必须是知识库名称或 ID。")
+            values[field] = text(value, field, 200) if value.strip() else ""
         return cls(
             **values,
             record_id=rid,

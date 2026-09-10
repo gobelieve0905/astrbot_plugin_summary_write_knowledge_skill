@@ -12,23 +12,89 @@ class AstrBotBackend:
         self.context = context
         self.config = config
 
-    async def ensure(self, project):
+    def configured_names(self):
+        # Keep the existing string key for config compatibility; one name/ID per line.
+        raw = self.config.get("template_kb", "")
+        if not isinstance(raw, str):
+            raise KnowledgeError("可用知识库应填写名称或 ID，每行一个；留空表示全部。")
+        return {line.strip() for line in raw.splitlines() if line.strip()}
+
+    def selected(self, kb):
+        names = self.configured_names()
+        return not names or kb.kb_id in names or kb.kb_name in names
+
+    async def catalog(self, blocked_ids=()):
+        return [
+            {"id": kb.kb_id, "name": kb.kb_name}
+            for kb in await self.context.kb_manager.list_kbs()
+            if kb.kb_id not in blocked_ids and self.selected(kb)
+        ]
+
+    async def ensure(self, project, plan=None, blocked_ids=()):
         manager = self.context.kb_manager
+        requested = plan.knowledge_base if plan else ""
         if project["kb_id"]:
             helper = await manager.get_kb(project["kb_id"])
+            if helper and requested and requested not in {helper.kb.kb_id, helper.kb.kb_name}:
+                raise KnowledgeError("项目已绑定其他知识库，不能在保存时切换索引库。")
         else:
-            name = "chat-knowledge-" + project["id"]
-            helper = await manager.get_kb_by_name(name)
-            if helper is None:
-                template = await manager.get_kb_by_name(self.config.get("template_kb", ""))
-                if template is None or template.init_error:
+            choices = await self.catalog(blocked_ids)
+            target = requested or project["name"]
+            matches = [kb for kb in choices if target in {kb["id"], kb["name"]}]
+            if len(matches) == 1:
+                helper = await manager.get_kb(matches[0]["id"])
+            elif requested or len(matches) > 1:
+                raise KnowledgeError("指定知识库不可用或不唯一，请从可用库目录选择准确 ID。")
+            else:
+                if not plan or not plan.create_project:
                     raise KnowledgeError(
-                        "请先配置可用的 template_kb；新项目复用该库的嵌入和重排序模型。"
+                        "找不到项目对应的知识库，请明确目标库，或说明要创建新项目资料。"
                     )
-                kb = template.kb
+                if self.configured_names():
+                    raise KnowledgeError(
+                        "已限制可用知识库，请选择指定库；创建新库前需将可用知识库范围留空。"
+                    )
+                # Don't create an alternative project/library to bypass an existing scope ACL.
+                existing = await manager.get_kb_by_name(project["name"])
+                if existing:
+                    raise KnowledgeError("同名知识库存在但当前范围不可访问，请联系管理员配置共享。")
+                source_id = plan.model_source
+                if source_id:
+                    sources = [kb for kb in choices if source_id in {kb["id"], kb["name"]}]
+                    if len(sources) != 1:
+                        raise KnowledgeError("模型配置来源不可用或不唯一，请选择准确知识库 ID。")
+                    source = await manager.get_kb(sources[0]["id"])
+                    if source is None or source.init_error:
+                        raise KnowledgeError("所选模型配置来源不可用。")
+                else:
+                    sources = [await manager.get_kb(kb["id"]) for kb in choices]
+                    sources = [
+                        kb
+                        for kb in sources
+                        if kb and not kb.init_error and kb.kb.embedding_provider_id
+                    ]
+                    if not sources:
+                        raise KnowledgeError(
+                            "没有可用的知识库模型配置，请先在 AstrBot 配置知识库。"
+                        )
+                    signatures = {
+                        (
+                            kb.kb.embedding_provider_id,
+                            kb.kb.rerank_provider_id,
+                            kb.kb.chunk_size,
+                            kb.kb.chunk_overlap,
+                        )
+                        for kb in sources
+                    }
+                    if len(signatures) != 1:
+                        raise KnowledgeError(
+                            "新项目可复用的模型配置有多种，请明确 model_source；不会默认选择第一个库。"
+                        )
+                    source = sources[0]  # All available model/chunk configurations are identical.
+                kb = source.kb
                 helper = await manager.create_kb(
-                    kb_name=name,
-                    description="聊天知识插件管理；请通过插件检索，不加入全局知识库列表。",
+                    kb_name=project["name"],
+                    description="聊天知识插件管理；有效版本和平台范围请通过插件工具检索。",
                     embedding_provider_id=kb.embedding_provider_id,
                     rerank_provider_id=kb.rerank_provider_id,
                     chunk_size=kb.chunk_size,
@@ -39,7 +105,8 @@ class AstrBotBackend:
                 )
         if helper is None or helper.init_error:
             raise KnowledgeError("项目知识库不可用，未完成保存。")
-        # Core otherwise silently degrades reranking. Fail explicitly when configured but missing.
+        if helper.kb.kb_id in blocked_ids or not self.selected(helper.kb):
+            raise KnowledgeError("该项目知识库不在当前可用范围内。")
         if helper.kb.rerank_provider_id and await helper.get_rp() is None:
             raise KnowledgeError("现有重排序模型不可用，请恢复模型后重试。")
         return helper

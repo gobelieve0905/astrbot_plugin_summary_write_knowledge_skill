@@ -91,7 +91,7 @@ async def main():
         conversation_manager=conversations,
         get_using_provider_async=AsyncMock(return_value=chat),
     )
-    config = dict(enabled=True, group_ids=["oc_test"], template_kb="existing-template")
+    config = dict(enabled=True, group_ids=["oc_test"], template_kb="")
     plugin = module.SummaryWriteKnowledgeSkill(context, config)
     bot = lark_oapi.Client.builder().app_id("cli_test").app_secret("unused").build()
 
@@ -261,6 +261,50 @@ async def main():
             await plugin.knowledge_read(skill_evt, skill_result["record_id"], "AppLovin")
         )
         assert skill_read["content"].startswith("---\nname:")
+        # Blank scope includes all existing libraries and writes to the chosen real library.
+        existing = await kb_manager.create_kb(
+            "Existing project", embedding_provider_id="ep", rerank_provider_id="rp"
+        )
+        original = await existing.upload_document(
+            file_name="original.md", file_content=b"original material", file_type="md"
+        )
+        existing_evt = event("existing-project-save")
+        await prepare(existing_evt)
+        library_catalog = json.loads(await plugin.knowledge_context(existing_evt))
+        assert {"existing-template", "Idol Empire", "Existing project"}.issubset(
+            {kb["name"] for kb in library_catalog["knowledge_bases"]}
+        )
+        existing_plan = {
+            **data,
+            "project": "Existing project",
+            "knowledge_base": existing.kb.kb_id,
+            "create_project": False,
+            "title": "新增结论",
+        }
+        existing_result = json.loads(
+            await plugin.knowledge_save(existing_evt, json.dumps(existing_plan))
+        )
+        assert existing_result["status"] == "saved", existing_result
+        assert plugin.store.project("Existing project")["kb_id"] == existing.kb.kb_id
+        assert await existing.get_document(original.doc_id) is not None
+        assert (
+            await existing.get_document(plugin.store.active(existing_result["record_id"])["doc_id"])
+            is not None
+        )
+        # Changing the allowlist applies to catalog, reads and searches for existing bindings.
+        plugin.service.backend.config["template_kb"] = "Idol Empire"
+        restricted = json.loads(await plugin.knowledge_context(existing_evt))
+        assert [kb["name"] for kb in restricted["knowledge_bases"]] == ["Idol Empire"]
+        assert "Existing project" not in {p["name"] for p in restricted["projects"]}
+        denied_read = json.loads(
+            await plugin.knowledge_read(existing_evt, existing_result["record_id"], "AppLovin")
+        )
+        assert denied_read["status"] == "needs_attention", denied_read
+        denied_search = json.loads(
+            await plugin.knowledge_search(existing_evt, "Existing project", "AppLovin", "结论")
+        )
+        assert denied_search["status"] == "needs_attention", denied_search
+        plugin.service.backend.config["template_kb"] = ""
         # Regression: core vector retrieval has a default SQL page of 100.
         large = await helper.upload_document(
             file_name="many-chunks.md",

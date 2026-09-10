@@ -148,7 +148,7 @@ class SummaryWriteKnowledgeSkill(Star):
             event.set_extra("summary_knowledge.read_ids", set())
             req.system_prompt += "\n" + SYSTEM
             req.system_prompt += "\n当前话题项目目录（数据）：" + json.dumps(
-                self.service.catalog(topic), ensure_ascii=False
+                await self.service.context_catalog(topic), ensure_ascii=False
             )
         except (KnowledgeError, ValueError, TypeError) as exc:
             event.set_extra("summary_knowledge.prepare_error", str(exc))
@@ -214,7 +214,7 @@ class SummaryWriteKnowledgeSkill(Star):
         async def action():
             topic = self.guard(event)
             event.set_extra("summary_knowledge.context_read", True)
-            return {"topic": topic.to_dict(), **self.service.catalog(topic)}
+            return {"topic": topic.to_dict(), **(await self.service.context_catalog(topic))}
 
         return await self.run_tool(event, action)
 
@@ -309,7 +309,7 @@ class SummaryWriteKnowledgeSkill(Star):
     async def status(self, event: AstrMessageEvent):
         state = "已启用" if self.enabled(event) else "未启用"
         yield event.plain_result(
-            f"知识管理：{state}。\n当前会话范围：{scope_of(event)}\n需要引用续聊和可用的 template_kb；仅实际写入与索引验证通过才确认保存。"
+            f"知识管理：{state}。\n当前会话范围：{scope_of(event)}\n需要引用续聊和可用知识库（范围留空表示全部）；仅实际写入与索引验证通过才确认保存。"
         )
 
     async def terminate(self):

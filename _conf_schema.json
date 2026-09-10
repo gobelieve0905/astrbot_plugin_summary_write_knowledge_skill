@@ -3,7 +3,7 @@
     "type": "bool",
     "default": false,
     "description": "启用知识沉淀",
-    "hint": "开启后，群聊和私聊列表留空表示全部启用；填写列表则仅启用指定会话。新建项目资料前需配置知识库模板。"
+    "hint": "开启后，群聊、私聊和可用知识库范围留空表示全部启用；填写则仅使用指定范围。"
   },
   "platform_ids": {
     "type": "list",
@@ -30,10 +30,10 @@
     "hint": "填写飞书用户 Open ID，每项一个。留空表示已启用会话内的全部成员均可写入。"
   },
   "template_kb": {
-    "type": "string",
+    "type": "text",
     "default": "",
-    "description": "知识库模板",
-    "hint": "填写已有知识库的名称或 ID。新项目复用它的嵌入模型、重排序模型和分块配置，不复制原有文档。"
+    "description": "可用知识库",
+    "hint": "留空表示所有知识库都可用；填写后仅使用指定库，名称或 ID 每行一个。Agent 根据当前话题选择项目和目标库，不会同时写入全部库；已有项目仍遵守共享权限。"
   },
   "project_shares_json": {
     "type": "text",

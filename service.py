@@ -60,6 +60,7 @@ class Service:
                 projects.append(
                     {
                         "name": p["name"],
+                        "knowledge_base_id": p["kb_id"],
                         "records": [
                             {
                                 **{
@@ -85,6 +86,27 @@ class Service:
                     }
                 )
         return {"bound_project": self.store.binding(topic.scope, topic.cid), "projects": projects}
+
+    def blocked_kbs(self, topic):
+        return {
+            p["kb_id"]
+            for p in self.store.projects()
+            if p["kb_id"] and not self.allowed(p, topic.scope)
+        }
+
+    async def context_catalog(self, topic):
+        libraries = await self.backend.catalog(self.blocked_kbs(topic))
+        ids = {kb["id"] for kb in libraries}
+        catalog = self.catalog(topic)
+        catalog["projects"] = [
+            p
+            for p in catalog["projects"]
+            if not p["knowledge_base_id"] or p["knowledge_base_id"] in ids
+        ]
+        return {**catalog, "knowledge_bases": libraries}
+
+    async def ensure_project(self, topic, project, plan=None):
+        return await self.backend.ensure(project, plan=plan, blocked_ids=self.blocked_kbs(topic))
 
     def path(self, row):
         basename = "SKILL.md" if row["kind"] == "skill" else "knowledge.md"
@@ -123,6 +145,7 @@ class Service:
             if row["kind"] == "skill"
             else None,
             "coverage": json.loads(row["source"])["coverage"],
+            "knowledge_base": json.loads(row["source"]).get("knowledge_base"),
             "obsolete_index_cleanup_pending": cleanup_pending,
         }
 
@@ -133,7 +156,7 @@ class Service:
             if prior and prior["state"] == "active":
                 # Even retries must prove storage remains usable.
                 p = self.project(plan.project, topic.scope)
-                helper = await self.backend.ensure(p)
+                helper = await self.ensure_project(topic, p)
                 self.checked_body(prior)
                 await self.backend.verify(helper, prior["doc_id"], plan.title)
                 return self.receipt(prior)
@@ -144,8 +167,13 @@ class Service:
             p = self.store.project(plan.project)
             if p and not self.allowed(p, topic.scope):
                 raise KnowledgeError("项目不存在或当前会话没有权限。")
-            if not p and not plan.create_project:
-                raise KnowledgeError("项目尚未建立，请确认这是新项目后再创建。")
+            catalog = await self.context_catalog(topic)
+            existing_target = any(
+                plan.project == kb["name"] or plan.knowledge_base in {kb["id"], kb["name"]}
+                for kb in catalog["knowledge_bases"]
+            )
+            if not p and not plan.create_project and not existing_target:
+                raise KnowledgeError("项目尚未建立，请明确目标知识库或说明这是新项目。")
             old = self.store.active(plan.record_id) if plan.record_id else None
             if plan.record_id and (
                 not old
@@ -168,7 +196,7 @@ class Service:
                 ]
                 if duplicate:
                     raise KnowledgeError("已有同名同范围知识，请读取其编号并更新，不能重复新增。")
-            verdict = await review(topic, plan, old, self.catalog(topic))
+            verdict = await review(topic, plan, old, catalog)
             if verdict.get("allow") is not True:
                 raise KnowledgeError(
                     str(verdict.get("question") or "保存意图、归属或内容尚不明确，请补充说明。")[
@@ -180,7 +208,7 @@ class Service:
                 raise KnowledgeError("本话题已有其他项目归属，请明确这次是否要保存到不同项目。")
             if not p:
                 p = self.store.create_project(plan.project, topic.scope)
-            helper = await self.backend.ensure(p)
+            helper = await self.ensure_project(topic, p, plan)
             self.store.set_kb(p["id"], helper.kb.kb_id)
             # A later explicit retry can resume an identical staged version without duplicates.
             if not prior:
@@ -188,7 +216,7 @@ class Service:
                     r
                     for r in self.store.records(p["id"], history=True)
                     if r["state"] == "pending"
-                    and json.loads(r["plan"]) == plan.to_dict()
+                    and Plan.parse(json.loads(r["plan"])).to_dict() == plan.to_dict()
                     and json.loads(r["source"])["scope"] == topic.scope
                     and json.loads(r["source"])["topic_id"] == topic.cid
                 ]
@@ -200,6 +228,8 @@ class Service:
                 version = plan.expected_version + 1
                 source = {
                     "scope": topic.scope,
+                    "knowledge_base": getattr(helper.kb, "kb_name", p["name"]),
+                    "knowledge_base_id": helper.kb.kb_id,
                     "topic_id": topic.cid,
                     "owner": topic.owner,
                     "message_id": topic.message_id,
@@ -251,7 +281,7 @@ class Service:
                     "请明确适用平台，不能混用不同平台规则；明确不限平台的资料用 all。"
                 )
             rows = [r for r in self.store.records(p["id"]) if r["platform"] in {platform, "all"}]
-            helper = await self.backend.ensure(p)
+            helper = await self.ensure_project(topic, p)
             mapping = {r["doc_id"]: r for r in rows}
             results = await self.backend.search(helper, query, set(mapping))
             return [
@@ -271,7 +301,8 @@ class Service:
             if not row:
                 raise KnowledgeError("找不到当前有效记录。")
             plan = json.loads(row["plan"])
-            self.project(plan["project"], topic.scope)
+            project = self.project(plan["project"], topic.scope)
+            await self.ensure_project(topic, project)
             if row["platform"] not in {platform, "all"}:
                 raise KnowledgeError("该知识不适用于指定平台。")
             return {
