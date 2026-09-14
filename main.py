@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -14,6 +13,7 @@ from .backend import AstrBotBackend
 from .directory import ChoiceDirectory, normalize_config
 from .models import KnowledgeError, Plan, TopicContext, text
 from .prompts import REVIEW, SYSTEM
+from .receipts import protect_knowledge_claims
 from .service import Service
 from .store import Store
 
@@ -276,6 +276,8 @@ class SummaryWriteKnowledgeSkill(Star):
             plan_json(string): 按系统提示规定的 JSON 保存计划。更新带原编号和版本，新项目需明确创建意图。
         """
 
+        event.set_extra("summary_knowledge.write_attempted", True)
+
         async def action():
             topic = self.guard(event, write=True)
             if not event.get_extra("summary_knowledge.context_read"):
@@ -308,9 +310,10 @@ class SummaryWriteKnowledgeSkill(Star):
     @filter.on_llm_response(priority=-20000)
     async def protect_receipt(self, event: AstrMessageEvent, response):
         if self.enabled(event) and not event.get_extra("summary_knowledge.receipts"):
-            completion = response.completion_text or ""
-            if re.search(r"(?<![未不])已(?:保存|入库|写入知识库)|技能已启用", completion):
-                response.completion_text = "本次没有获得成功的知识写入回执，因此尚不能确认已保存。请查看操作结果，明确项目或重试。"
+            response.completion_text = protect_knowledge_claims(
+                response.completion_text or "",
+                write_attempted=bool(event.get_extra("summary_knowledge.write_attempted")),
+            )
 
     @filter.command("知识管理状态")
     async def status(self, event: AstrMessageEvent):

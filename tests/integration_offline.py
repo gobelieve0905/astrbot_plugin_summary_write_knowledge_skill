@@ -229,6 +229,11 @@ async def main():
         false_receipt = LLMResponse(role="assistant", completion_text="已保存到知识库。")
         await plugin.protect_receipt(invalid, false_receipt)
         assert "尚不能确认" in false_receipt.completion_text
+        report = LLMResponse(
+            role="assistant", completion_text="报表已保存为 JSON。尚未查询全部账户。"
+        )
+        await plugin.protect_receipt(invalid, report)
+        assert report.completion_text == "报表已保存为 JSON。尚未查询全部账户。"
         # Writer permissions and malformed independent validation fail before mutation.
         config["writer_ids"] = ["administrator"]
         denied = json.loads(await plugin.knowledge_save(second, json.dumps(update)))

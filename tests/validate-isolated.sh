@@ -7,7 +7,7 @@ stage=$(ssh "$server" 'mktemp -d /var/tmp/knowledge-plugin-test.XXXXXX')
 cleanup() { ssh "$server" "sudo rm -rf -- '$stage'" >/dev/null; }
 trap cleanup EXIT
 cd "$plugin_root"
-COPYFILE_DISABLE=1 tar --no-xattrs -cf - main.py models.py prompts.py backend.py store.py service.py directory.py tests | ssh "$server" "tar -xf - -C '$stage'"
+COPYFILE_DISABLE=1 tar --no-xattrs -cf - main.py receipts.py models.py prompts.py backend.py store.py service.py directory.py tests | ssh "$server" "tar -xf - -C '$stage'"
 ssh "$server" sudo bash -s -- "$stage" <<'REMOTE'
 set -euo pipefail
 stage=$1
