@@ -1,4 +1,4 @@
-"""Chat-facing tools for AstrBot 4.28.0; independent of card rendering."""
+"""Chat-facing tools for AstrBot 4.28.x; independent of card rendering."""
 
 from __future__ import annotations
 
