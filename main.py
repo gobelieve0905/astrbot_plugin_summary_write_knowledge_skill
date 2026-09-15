@@ -31,6 +31,7 @@ KNOWLEDGE_TOOLS = (
     "knowledge_search",
     "knowledge_read",
     "knowledge_save",
+    "knowledge_save_status",
     "knowledge_source_read",
     "knowledge_source_select",
     "knowledge_artifact_import",
@@ -971,6 +972,7 @@ class SummaryWriteKnowledgeSkill(Star):
                 "source_directory": window.directory(offset),
                 "task_artifacts": self.deliveries.catalog(topic),
                 "deliveries": self.deliveries.recent(topic),
+                "save_tasks": self.service.status(topic),
                 "attachment_notices": event.get_extra("summary_knowledge.attachment_notices", []),
                 **(await self.service.context_catalog(topic)),
             }
@@ -1064,6 +1066,33 @@ class SummaryWriteKnowledgeSkill(Star):
 
         return await self.run_tool(event, action)
 
+    @filter.llm_tool(name="knowledge_save_status")
+    async def knowledge_save_status(self, event: AstrMessageEvent, task_id: str = ""):
+        """查询本用户当前话题的保存状态；处理中继续等待，saved 才能确认保存，不需要重新提交正文。
+
+        Args:
+            task_id(string): 保存返回的 task_id；留空列出最近任务。
+        """
+
+        async def action():
+            topic = self.guard(event)
+            result = self.service.status(topic, task_id)
+            if isinstance(result, dict) and result.get("status") == "saved":
+                # Recheck availability and index before repeating a success receipt.
+                record = await self.service.read(topic, result["record_id"], result["platform"])
+                if record["version"] != result["version"]:
+                    return {"status": "superseded", "message": "该任务已保存，但已有更新版本。"}
+                row = self.store.active(result["record_id"])
+                project = self.service.project(record["project"], topic.scope)
+                helper = await self.service.ensure_project(topic, project)
+                await self.service.backend.verify(helper, row["doc_id"], result["title"])
+                receipts = event.get_extra("summary_knowledge.receipts", [])
+                receipts.append(result)
+                event.set_extra("summary_knowledge.receipts", receipts)
+            return result
+
+        return await self.run_tool(event, action)
+
     @filter.llm_tool(name="knowledge_save")
     async def knowledge_save(self, event: AstrMessageEvent, plan_json: str):
         """用户明确要求长期保存时，校验并写入一个知识/规则/项目 Skill，更新索引并验证；只有 status=saved 才能回复已保存。
@@ -1084,8 +1113,13 @@ class SummaryWriteKnowledgeSkill(Star):
                 plan = Plan.parse(json.loads(plan_json))
             except ValueError:
                 raise KnowledgeError("plan_json 不是有效 JSON。") from None
-            if plan.record_id and plan.record_id not in event.get_extra(
-                "summary_knowledge.read_ids", set()
+            if (
+                (plan.record_id or plan.native_document)
+                and (plan.record_id or plan.native_document)
+                not in event.get_extra("summary_knowledge.read_ids", set())
+                and not self.service.resumable(
+                    topic, plan, event.get_extra("summary_knowledge.delivery_key", "")
+                )
             ):
                 raise KnowledgeError("修改前必须调用 knowledge_read 读取当前全文。")
             window = event.get_extra("summary_knowledge.window")
@@ -1111,15 +1145,16 @@ class SummaryWriteKnowledgeSkill(Star):
                     )
                 return result
 
-            result = await self.service.save(
+            result = await self.service.submit(
                 topic,
                 plan,
                 review,
                 operation_key=event.get_extra("summary_knowledge.delivery_key", ""),
             )
             receipts = event.get_extra("summary_knowledge.receipts", [])
-            receipts.append(result)
-            event.set_extra("summary_knowledge.receipts", receipts)
+            if result.get("status") == "saved":
+                receipts.append(result)
+                event.set_extra("summary_knowledge.receipts", receipts)
             return result
 
         return await self.run_tool(event, action)
@@ -1171,6 +1206,10 @@ class SummaryWriteKnowledgeSkill(Star):
         if self.artifact_task:
             self.artifact_task.cancel()
             await asyncio.gather(self.artifact_task, return_exceptions=True)
+        for job in self.service.jobs.values():
+            if not job.done():
+                job.cancel()
+        await asyncio.gather(*self.service.jobs.values(), return_exceptions=True)
         await self.directory.close()
         tasks = [t for t in self.active if t is not asyncio.current_task()]
         if tasks:

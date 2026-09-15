@@ -9,7 +9,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from .models import KnowledgeError, Plan, digest, render
+from .models import KnowledgeError, Plan, digest, render, utcnow
 
 
 def write_atomic(path: Path, content: str):
@@ -42,9 +42,136 @@ class Service:
         self.config = config
         # One process supported. Serializing our reads/writes also protects core helper reloads.
         self.lock = asyncio.Lock()
+        self.jobs = {}
+        store.db.execute(
+            "CREATE TABLE IF NOT EXISTS save_jobs(id TEXT PRIMARY KEY, scope TEXT, cid TEXT, actor TEXT, state TEXT, detail TEXT, updated TEXT, plan TEXT)"
+        )
+        with store.db:
+            store.db.execute(
+                "UPDATE save_jobs SET state='interrupted', detail=? WHERE state IN ('queued','reviewing','writing','indexing')",
+                (
+                    json.dumps(
+                        {"message": "服务重载中断，请用相同计划重试；已暂存的版本会继续验证。"},
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+
+    def progress(self, ident, state, detail=None):
+        if ident:
+            with self.store.db:
+                self.store.db.execute(
+                    "UPDATE save_jobs SET state=?,detail=?,updated=? WHERE id=?",
+                    (state, json.dumps(detail or {}, ensure_ascii=False), utcnow(), ident),
+                )
+
+    def status(self, topic, ident=""):
+        rows = self.store.db.execute(
+            "SELECT * FROM save_jobs WHERE scope=? AND cid=? AND actor=?"
+            + (" AND id=?" if ident else "")
+            + " ORDER BY updated DESC LIMIT 30",
+            (topic.scope, topic.cid, topic.actor) + ((ident,) if ident else ()),
+        ).fetchall()
+        output = [
+            {
+                "task_id": r["id"],
+                "status": r["state"],
+                **json.loads(r["detail"]),
+                "updated": r["updated"],
+                **(
+                    {"retry_plan": json.loads(r["plan"])}
+                    if r["state"] in {"needs_attention", "interrupted"}
+                    else {}
+                ),
+            }
+            for r in rows
+        ]
+        if ident:
+            found = next((r for r in output if r["task_id"] == ident), None)
+            if found is None:
+                raise KnowledgeError("保存任务不存在或不属于当前用户和话题。")
+            return found
+        return output
+
+    def task_id(self, topic, plan, operation_key=""):
+        return digest([topic.scope, topic.cid, topic.actor, operation_key, plan.to_dict()])
+
+    def resumable(self, topic, plan, operation_key=""):
+        return (
+            self.store.db.execute(
+                "SELECT 1 FROM save_jobs WHERE id=?", (self.task_id(topic, plan, operation_key),)
+            ).fetchone()
+            is not None
+        )
+
+    async def submit(self, topic, plan, review, operation_key="", wait_seconds=15):
+        ident = self.task_id(topic, plan, operation_key)
+        with self.store.db:
+            self.store.db.execute(
+                "INSERT OR IGNORE INTO save_jobs VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    ident,
+                    topic.scope,
+                    topic.cid,
+                    topic.actor,
+                    "queued",
+                    "{}",
+                    utcnow(),
+                    json.dumps(plan.to_dict(), ensure_ascii=False),
+                ),
+            )
+        running = self.jobs.get(ident)
+        if running is None or running.done():
+
+            async def execute():
+                try:
+                    result = await self.save(topic, plan, review, operation_key=ident, job_id=ident)
+                    self.progress(ident, "saved", result)
+                    return {**result, "task_id": ident}
+                except asyncio.CancelledError:
+                    self.progress(
+                        ident,
+                        "interrupted",
+                        {"message": "保存被中断；请用原计划重试以核对或继续暂存写入。"},
+                    )
+                    raise
+                except Exception as exc:
+                    message = (
+                        str(exc)
+                        if isinstance(exc, KnowledgeError)
+                        else "保存阶段未完成，请用相同计划重试；不会重复创建暂存版本。"
+                    )
+                    if (
+                        isinstance(exc, TimeoutError)
+                        and self.status(topic, ident)["status"] == "reviewing"
+                    ):
+                        message = "模型校验超时，尚未开始本次文档写入；可缩小明确来源范围后重试。"
+                    self.progress(
+                        ident,
+                        "needs_attention",
+                        {"message": message, "stage": self.status(topic, ident)["status"]},
+                    )
+                    return self.status(topic, ident)
+
+            running = asyncio.create_task(execute())
+            self.jobs[ident] = running
+            running.add_done_callback(
+                lambda task: self.jobs.pop(ident, None) if self.jobs.get(ident) is task else None
+            )
+        try:
+            return await asyncio.wait_for(asyncio.shield(running), timeout=wait_seconds)
+        except TimeoutError:
+            return {
+                "status": "processing",
+                "task_id": ident,
+                "stage": self.status(topic, ident)["status"],
+                "message": "保存仍在处理，请用 knowledge_save_status 查询；不要重复新增或宣称已保存。",
+            }
 
     def allowed(self, project, scope):
         shares = self.config.get("project_shares", {})
+        if project["scope"] == "*":
+            return project["name"] not in shares or scope in shares[project["name"]]
         return project["scope"] == scope or scope in shares.get(project["name"], [])
 
     def project(self, name, scope):
@@ -149,7 +276,7 @@ class Service:
             "obsolete_index_cleanup_pending": cleanup_pending,
         }
 
-    async def save(self, topic, plan: Plan, review, operation_key=""):
+    async def save(self, topic, plan: Plan, review, operation_key="", job_id=""):
         async with self.lock:
             op = digest([topic.scope, operation_key or topic.message_id, plan.to_dict()])
             prior = self.store.operation(op)
@@ -196,7 +323,30 @@ class Service:
                 ]
                 if duplicate:
                     raise KnowledgeError("已有同名同范围知识，请读取其编号并更新，不能重复新增。")
-            verdict = await review(topic, plan, old, catalog)
+            if existing_target or p:
+                _, target_helper = await self.resolve(topic, plan.knowledge_base or plan.project)
+                catalog["target_documents"] = [
+                    {"doc_id": d.doc_id, "title": d.doc_name}
+                    for d in await self.backend.documents(target_helper)
+                ]
+            native_old = None
+            if plan.native_document:
+                native_old = json.loads(prior["source"]).get("native_previous") if prior else None
+                if native_old is None:
+                    native_old = await self.native_read(topic, plan.native_document)
+                if native_old["sha256"] != plan.expected_sha256:
+                    raise KnowledgeError("原生文档已变化，请重新读取后更新。")
+                _, target = await self.resolve(topic, plan.knowledge_base or plan.project)
+                if native_old["knowledge_base"] != target.kb.kb_id:
+                    raise KnowledgeError("不能替换其他知识库的文档。")
+            self.progress(job_id, "reviewing")
+            verdict = await review(
+                topic,
+                plan,
+                old
+                or ({"plan": json.dumps(native_old, ensure_ascii=False)} if native_old else None),
+                catalog,
+            )
             if verdict.get("allow") is not True:
                 raise KnowledgeError(
                     str(verdict.get("question") or "保存意图、归属或内容尚不明确，请补充说明。")[
@@ -206,8 +356,9 @@ class Service:
             bound = self.store.binding(topic.scope, topic.cid)
             if bound and bound != plan.project and verdict.get("explicit_project") is not True:
                 raise KnowledgeError("本话题已有其他项目归属，请明确这次是否要保存到不同项目。")
+            self.progress(job_id, "writing")
             if not p:
-                p = self.store.create_project(plan.project, topic.scope)
+                p = self.store.create_project(plan.project, "*" if existing_target else topic.scope)
             helper = await self.ensure_project(topic, p, plan)
             self.store.set_kb(p["id"], helper.kb.kb_id)
             # A later explicit retry can resume an identical staged version without duplicates.
@@ -227,6 +378,7 @@ class Service:
                 rid = plan.record_id or uuid.uuid4().hex
                 version = plan.expected_version + 1
                 source = {
+                    "native_previous": native_old,
                     "scope": topic.scope,
                     "knowledge_base": getattr(helper.kb, "kb_name", p["name"]),
                     "knowledge_base_id": helper.kb.kb_id,
@@ -260,44 +412,102 @@ class Service:
             write_atomic(path, body)
             doc_id = prior["doc_id"] or await self.backend.upload(helper, prior["filename"], body)
             self.store.set_doc(op, doc_id)
+            self.progress(job_id, "indexing")
             await self.backend.verify(helper, doc_id, plan.title)
             if path.read_text(encoding="utf-8") != body:
                 raise KnowledgeError("文件回读验证失败，本次未生效。")
-            self.store.activate(op, plan.expected_version, topic.scope, topic.cid)
-            cleanup_pending = False
+            if plan.native_document:
+                doc_id_old = plan.native_document.split(":")[2]
+                current_old = await helper.get_document(doc_id_old)
+                if current_old is not None:
+                    checked = await self.backend.read_document(helper, doc_id_old)
+                    if checked["sha256"] != plan.expected_sha256:
+                        raise KnowledgeError("旧文档在保存期间变化，暂不替换，请检查待处理任务。")
+                    await self.backend.delete(helper, doc_id_old)
+                if await helper.get_document(doc_id_old) is not None:
+                    raise KnowledgeError("旧文档清理未完成，尚不能确认保存。")
             if old:
-                try:
-                    await self.backend.delete(helper, old["doc_id"])
-                except Exception:
-                    cleanup_pending = (
-                        True  # The old doc is already excluded by our active manifest.
-                    )
-            return self.receipt(self.store.operation(op), cleanup_pending)
+                # Native AstrBot retrieval must also stop seeing the old rule.
+                # Do not issue a success receipt while cleanup has failed.
+                await self.backend.delete(helper, old["doc_id"])
+            self.store.activate(op, plan.expected_version, topic.scope, topic.cid)
+            return self.receipt(self.store.operation(op))
+
+    async def resolve(self, topic, name):
+        p = self.store.project(name)
+        if p is None:
+            p = next((item for item in self.store.projects() if item["kb_id"] == name), None)
+        if p:
+            if not self.allowed(p, topic.scope):
+                raise KnowledgeError("此项目已配置会话共享限制，当前会话无权访问。")
+            return p, await self.ensure_project(topic, p)
+        choices = await self.backend.catalog(self.blocked_kbs(topic))
+        matches = [kb for kb in choices if name in {kb["id"], kb["name"]}]
+        if len(matches) != 1:
+            raise KnowledgeError(
+                "没有唯一匹配的可用原生知识库，请从 knowledge_context 选择名称或 ID。"
+            )
+        p = {"name": matches[0]["name"], "kb_id": matches[0]["id"], "id": ""}
+        return p, await self.ensure_project(topic, p)
+
+    async def native_read(self, topic, ref):
+        parts = ref.split(":")
+        if len(parts) != 3 or parts[0] != "native":
+            raise KnowledgeError("原生文档编号无效。")
+        _, helper = await self.resolve(topic, parts[1])
+        # Managed pending/obsolete documents cannot be read via the native fallback.
+        if self.store.db.execute("SELECT 1 FROM revisions WHERE doc_id=?", (parts[2],)).fetchone():
+            raise KnowledgeError("此文档已有版本记录，请使用目录中的有效 record_id。")
+        return {
+            **await self.backend.read_document(helper, parts[2]),
+            "record_id": ref,
+            "knowledge_base": helper.kb.kb_id,
+            "platform": "unknown",
+            "version": 0,
+            "notice_scope": "原生旧文档未标注平台，请根据正文确认适用范围，不能自动视为 all。",
+        }
 
     async def search(self, topic, project, platform, query):
         async with self.lock:
-            p = self.project(project, topic.scope)
+            p, helper = await self.resolve(topic, project)
             if not platform.strip():
-                raise KnowledgeError(
-                    "请明确适用平台，不能混用不同平台规则；明确不限平台的资料用 all。"
-                )
+                raise KnowledgeError("请明确适用平台。")
             rows = [r for r in self.store.records(p["id"]) if r["platform"] in {platform, "all"}]
-            helper = await self.ensure_project(topic, p)
             mapping = {r["doc_id"]: r for r in rows}
-            results = await self.backend.search(helper, query, set(mapping))
-            return [
-                {
-                    **item,
-                    "record_id": mapping[item["doc_id"]]["record_id"],
-                    "version": mapping[item["doc_id"]]["version"],
-                    "platform": mapping[item["doc_id"]]["platform"],
-                    "kind": mapping[item["doc_id"]]["kind"],
-                }
-                for item in results
-            ]
+            managed = {r[0] for r in self.store.db.execute("SELECT doc_id FROM revisions")}
+            docs = await self.backend.documents(helper)
+            native = {d.doc_id: d for d in docs if d.doc_id not in managed}
+            results = await self.backend.search(helper, query, set(mapping) | set(native))
+            output = []
+            for item in results:
+                r = mapping.get(item["doc_id"])
+                output.append(
+                    {
+                        **item,
+                        **(
+                            {
+                                "record_id": r["record_id"],
+                                "version": r["version"],
+                                "platform": r["platform"],
+                                "kind": r["kind"],
+                            }
+                            if r
+                            else {
+                                "record_id": f"native:{helper.kb.kb_id}:{item['doc_id']}",
+                                "title": native[item["doc_id"]].doc_name,
+                                "platform": "unknown",
+                                "version": 0,
+                                "notice": "原生文档候选，须读取正文确认平台，未自动判为适用。",
+                            }
+                        ),
+                    }
+                )
+            return output
 
     async def read(self, topic, record_id, platform):
         async with self.lock:
+            if record_id.startswith("native:"):
+                return await self.native_read(topic, record_id)
             row = self.store.active(record_id)
             if not row:
                 raise KnowledgeError("找不到当前有效记录。")
@@ -313,5 +523,9 @@ class Service:
                 "platform": row["platform"],
                 "kind": row["kind"],
                 "content": self.checked_body(row),
-                "source": json.loads(row["source"]),
+                "source": {
+                    k: v
+                    for k, v in json.loads(row["source"]).items()
+                    if k not in {"snapshot", "native_previous"}
+                },
             }

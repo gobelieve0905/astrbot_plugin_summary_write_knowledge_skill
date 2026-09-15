@@ -279,6 +279,19 @@ async def main():
         assert {"existing-template", "Idol Empire", "Existing project"}.issubset(
             {kb["name"] for kb in library_catalog["knowledge_bases"]}
         )
+        # Existing native documents are searchable/readable without a plugin project.
+        found_native = json.loads(
+            await plugin.knowledge_search(existing_evt, "Existing project", "Meta", "original")
+        )
+        assert found_native["status"] == "ok", found_native
+        ref = next(
+            r["record_id"] for r in found_native["results"] if r["doc_id"] == original.doc_id
+        )
+        read_native = json.loads(await plugin.knowledge_read(existing_evt, ref, "Meta"))
+        assert read_native["complete"] and "original material" in read_native["content"], (
+            read_native
+        )
+        assert plugin.store.project("Existing project") is None
         existing_plan = {
             **data,
             "project": "Existing project",
@@ -296,6 +309,34 @@ async def main():
             await existing.get_document(plugin.store.active(existing_result["record_id"])["doc_id"])
             is not None
         )
+        conflict_plan = {**existing_plan, "native_document": ref, "expected_sha256": "0" * 64}
+        conflict = json.loads(await plugin.knowledge_save(existing_evt, json.dumps(conflict_plan)))
+        assert conflict["status"] == "needs_attention", conflict
+        assert await existing.get_document(original.doc_id) is not None
+        native_replace = {
+            **existing_plan,
+            "title": "原生文档新版本",
+            "native_document": ref,
+            "expected_sha256": read_native["sha256"],
+        }
+        replaced = json.loads(await plugin.knowledge_save(existing_evt, json.dumps(native_replace)))
+        assert replaced["status"] == "saved", replaced
+        assert await existing.get_document(original.doc_id) is None
+        replacement_row = plugin.store.active(replaced["record_id"])
+        assert "original material" not in plugin.service.checked_body(replacement_row)
+        again = json.loads(await plugin.knowledge_save(existing_evt, json.dumps(native_replace)))
+        assert again["record_id"] == replaced["record_id"], again
+
+        current_native = json.loads(
+            await plugin.knowledge_search(existing_evt, existing.kb.kb_id, "AppLovin", "标准")
+        )
+        assert any(r["record_id"] == replaced["record_id"] for r in current_native["results"]), (
+            current_native
+        )
+        saved_status = json.loads(
+            await plugin.knowledge_save_status(existing_evt, replaced["task_id"])
+        )
+        assert saved_status["status"] == "saved", saved_status
         # Changing the allowlist applies to catalog, reads and searches for existing bindings.
         plugin.service.backend.config["template_kb"] = "Idol Empire"
         restricted = json.loads(await plugin.knowledge_context(existing_evt))

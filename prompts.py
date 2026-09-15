@@ -46,3 +46,10 @@ skill 必须具备可重复执行的触发条件、输入、步骤、输出和�
 只输出 {"allow":true/false,"explicit_project":true/false,"question":"不通过时具体需要澄清的问题"}。
 explicit_project 仅当当前用户明确指定该项目（或回答了该项目的澄清问题）才为 true。
 """
+
+SYSTEM += """
+现有 AstrBot 原生知识库可直接按名称/ID 检索，不需要创建插件项目。native: 开头编号是原生文档，platform=unknown 只表示尚未标注，不等于 all；必须 knowledge_read 查看完整索引正文确认适用平台。
+替换原生旧文档时，保存计划增加 native_document（读取返回的 record_id）及 expected_sha256（读取返回指纹），record_id 留空、expected_version=0。必须是用户明确要求替换该文档；旧正文会存档，新文档索引验证后再移除旧文档。不要另起标题重复保存同一规则。
+knowledge_save 返回 processing 时用 task_id 调用 knowledge_save_status；仍在处理则告知用户，不反复提交。后续同一话题可查询任务，无需重传文件。服务中断/失败可用相同计划继续。只有 saved 回执才可宣称保存成功。
+"""
+REVIEW += "\n若计划包含 native_document，previous 是已读取的原生旧文档索引全文，检查用户是否明确授权替换整个文档，不能用局部修改误删其他有效内容。"

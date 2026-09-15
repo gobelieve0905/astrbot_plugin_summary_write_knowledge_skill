@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from .directory import selections
-from .models import KnowledgeError
+from .models import KnowledgeError, digest
 
 
 class AstrBotBackend:
@@ -203,3 +203,32 @@ class AstrBotBackend:
     async def delete(self, helper, doc_id):
         if await helper.get_document(doc_id):
             await helper.delete_document(doc_id)
+
+    async def documents(self, helper):
+        count = await helper.count_documents()
+        if count > int(self.config.get("max_index_chunks", 5000)):
+            raise KnowledgeError("知识库文档数量超过读取上限，请缩小范围。")
+        return await helper.list_documents(limit=max(count, 1))
+
+    async def read_document(self, helper, doc_id):
+        doc = await helper.get_document(doc_id)
+        if doc is None or doc.kb_id != helper.kb.kb_id:
+            raise KnowledgeError("原生文档不存在或不属于指定知识库。")
+        count = await helper.get_chunk_count_by_doc_id(doc_id)
+        if count < 1 or count > int(self.config.get("max_index_chunks", 5000)):
+            raise KnowledgeError("文档索引为空或超过读取上限。")
+        chunks = await helper.get_chunks_by_doc_id(doc_id, limit=count)
+        chunks.sort(key=lambda c: c["chunk_index"])
+        if len(chunks) != count or any(c["kb_id"] != helper.kb.kb_id for c in chunks):
+            raise KnowledgeError("文档索引不完整。")
+        body = "\n\n".join(c["content"] for c in chunks)
+        if len(body) > 100000:
+            raise KnowledgeError("原生文档索引正文超过 100000 字符，请先拆分文档。")
+        return {
+            "content": body,
+            "sha256": digest(chunks),
+            "title": doc.doc_name,
+            "content_kind": "indexed_chunks",
+            "complete": True,
+            "notice": "这是原生库全部索引文本，可能含分块重叠，不等同于原始附件。",
+        }

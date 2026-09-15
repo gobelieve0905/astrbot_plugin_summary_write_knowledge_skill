@@ -65,6 +65,8 @@ class Plan:
     effective_at: str = ""
     knowledge_base: str = ""
     model_source: str = ""
+    native_document: str = ""
+    expected_sha256: str = ""
 
     @classmethod
     def parse(cls, raw):
@@ -105,7 +107,19 @@ class Plan:
             if not isinstance(value, str):
                 raise KnowledgeError(f"{field} 必须是知识库名称或 ID。")
             values[field] = text(value, field, 200) if value.strip() else ""
+        native = raw.get("native_document", "")
+        sha = raw.get("expected_sha256", "")
+        if not isinstance(native, str) or not isinstance(sha, str):
+            raise KnowledgeError("原生文档编号和指纹必须是字符串。")
+        if bool(native) != bool(sha) or (
+            native and (not native.startswith("native:") or rid or len(sha) != 64)
+        ):
+            raise KnowledgeError(
+                "替换原生文档须同时提供读取返回的 native_document 和 expected_sha256，不能同时指定 record_id。"
+            )
         return cls(
+            native_document=native,
+            expected_sha256=sha,
             **values,
             record_id=rid,
             expected_version=version,
@@ -126,7 +140,7 @@ def render(plan, record_id, version, source, created):
         "kind": plan.kind,
         "created_at": created,
         "effective_at": plan.effective_at or created,
-        "source": {k: v for k, v in source.items() if k != "snapshot"},
+        "source": {k: v for k, v in source.items() if k not in {"snapshot", "native_previous"}},
         "change_reason": plan.reason,
     }
     body = f"# {plan.title}\n\n{plan.content}\n\n## 来源与版本\n\n```json\n"

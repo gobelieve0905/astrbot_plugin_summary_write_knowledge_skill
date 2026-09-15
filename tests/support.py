@@ -42,6 +42,9 @@ class Backend:
             raise OSError("simulated failure")
         self.docs.pop(doc_id, None)
 
+    async def documents(self, helper):
+        return [types.SimpleNamespace(doc_id=d, doc_name=d) for d in self.docs]
+
     async def search(self, helper, query, allowed, limit=5):
         return [
             {"doc_id": d, "content": body, "score": 1.0}

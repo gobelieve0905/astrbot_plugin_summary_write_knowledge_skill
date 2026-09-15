@@ -94,18 +94,17 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(self.store.active(first["record_id"])["version"], 1)
 
-    async def test_failed_cleanup_excludes_stale_index(self):
+    async def test_failed_cleanup_does_not_confirm_native_success(self):
         first = await self.save()
         self.backend.fail_delete = True
-        result = await self.service.save(
-            topic(mid="m2"),
-            plan(record_id=first["record_id"], expected_version=1, content="新标准"),
-            allow,
-        )
-        self.assertTrue(result["obsolete_index_cleanup_pending"])
-        found = await self.service.search(topic(), "Idol Empire", "AppLovin", "标准")
-        self.assertEqual(len(found), 1)
-        self.assertEqual(found[0]["version"], 2)
+        update = plan(record_id=first["record_id"], expected_version=1, content="新标准")
+        with self.assertRaises(OSError):
+            await self.service.save(topic(mid="m2"), update, allow)
+        self.assertEqual(self.store.active(first["record_id"])["version"], 1)
+        self.backend.fail_delete = False
+        result = await self.service.save(topic(mid="m2"), update, allow)
+        self.assertEqual(result["version"], 2)
+        self.assertEqual(len(self.backend.docs), 1)
 
     async def test_other_platform_never_returned(self):
         await self.save()
