@@ -28,3 +28,21 @@ def protect_knowledge_claims(completion, *, write_attempted=False):
             sentences[j] = NOTICE + ending
         parts[index] = "".join(sentences)
     return "".join(parts)
+
+
+def protect_native_claims(completion):
+    parts = re.split(r"(```[\s\S]*?```)", completion)
+    for i in range(0, len(parts), 2):
+        sentences = re.split(r"(?<=[。！？\n])", parts[i])
+        for j, sentence in enumerate(sentences):
+            match = re.search(r"已(?:安装|更新|启用|注册)|安装成功|更新成功", sentence)
+            if (
+                match
+                and not sentence.lstrip().startswith(">")
+                and not NEGATED.search(sentence[: match.start()])
+            ):
+                sentences[j] = "本次没有成功的原生技能安装回执，尚不能确认安装或更新成功。" + (
+                    "\n" if sentence.endswith("\n") else ""
+                )
+        parts[i] = "".join(sentences)
+    return "".join(parts)

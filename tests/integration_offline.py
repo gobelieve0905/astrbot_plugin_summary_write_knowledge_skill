@@ -457,6 +457,41 @@ async def main():
             actual = json.loads(await plugin.native_skill_read(skill_evt, "skill-creator"))
             assert actual["status"] == "ok" and "skill" in actual["content"].lower(), actual
             assert actual["total_chars"] > 1000
+            context.persona_manager.resolve_selected_persona.return_value = (
+                "fixture",
+                {"skills": ["skill-creator", "meta-query"]},
+                None,
+                False,
+            )
+            install_evt = event("native-install")
+            install_evt.role = "admin"
+            await prepare(install_evt)
+            page = json.loads(await plugin.native_skill_read(install_evt, "skill-creator"))
+            while page["next_offset"] is not None:
+                page = json.loads(
+                    await plugin.native_skill_read(
+                        install_evt, "skill-creator", offset=page["next_offset"]
+                    )
+                )
+            body = "---\nname: meta-query\ndescription: Meta 通用查询流程\n---\n确认项目后用现有查询工具取数并核对分页，只读。\n"
+            installed = json.loads(
+                await plugin.native_skill_install(install_evt, "meta-query", body, "用户要求安装")
+            )
+            assert installed["status"] == "installed", installed
+            readback = json.loads(await plugin.native_skill_read(install_evt, "meta-query"))
+            assert readback["content"] == body, readback
+            updated = json.loads(
+                await plugin.native_skill_install(
+                    install_evt, "meta-query", body + "核对时区。", "更新规范", readback["sha256"]
+                )
+            )
+            assert updated["status"] == "installed", updated
+            install_evt.role = "member"
+            denied = json.loads(
+                await plugin.native_skill_install(install_evt, "meta-query", body, "安装")
+            )
+            assert denied["status"] == "needs_attention", denied
+
         finally:
             star_registry.remove(builtin)
         # An unavailable attachment is reported without disabling all history tools.
