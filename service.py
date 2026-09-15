@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 
 from .models import KnowledgeError, Plan, digest, render, utcnow
+from .project_validation import audit
 
 
 def write_atomic(path: Path, content: str):
@@ -48,6 +49,9 @@ class Service:
         )
         store.db.execute(
             "CREATE TABLE IF NOT EXISTS save_sources(id TEXT PRIMARY KEY, topic TEXT NOT NULL, evidence TEXT NOT NULL)"
+        )
+        store.db.execute(
+            "CREATE TABLE IF NOT EXISTS project_audits(id TEXT PRIMARY KEY, project TEXT NOT NULL, fingerprint TEXT NOT NULL, report TEXT NOT NULL, created TEXT NOT NULL)"
         )
         with store.db:
             store.db.execute(
@@ -311,6 +315,20 @@ class Service:
 
     async def save(self, topic, plan: Plan, review, operation_key="", job_id=""):
         async with self.lock:
+            assignment = audit(
+                topic,
+                plan.project,
+                self.store.projects(),
+                self.store.binding(topic.scope, topic.cid),
+            )
+            if assignment.confidence == "low":
+                raise KnowledgeError("项目归属证据不足，请明确本次保存项目。")
+            with self.store.db:
+                self.store.db.execute(
+                    "INSERT OR REPLACE INTO project_audits VALUES(?,?,?,?,?)",
+                    (operation_key or digest([topic.cid, plan.to_dict()]), plan.project,
+                     assignment.fingerprint, json.dumps(assignment.to_dict(), ensure_ascii=False), utcnow()),
+                )
             op = digest([topic.scope, operation_key or topic.message_id, plan.to_dict()])
             prior = self.store.operation(op)
             if prior and prior["state"] == "active":
@@ -387,6 +405,9 @@ class Service:
                     ]
                 )
             bound = self.store.binding(topic.scope, topic.cid)
+            latest = audit(topic, plan.project, self.store.projects(), bound)
+            if latest.fingerprint != assignment.fingerprint:
+                raise KnowledgeError("会话项目归属在保存期间发生变化，请重新确认项目后再试。")
             if bound and bound != plan.project and verdict.get("explicit_project") is not True:
                 raise KnowledgeError("本话题已有其他项目归属，请明确这次是否要保存到不同项目。")
             self.progress(job_id, "writing")

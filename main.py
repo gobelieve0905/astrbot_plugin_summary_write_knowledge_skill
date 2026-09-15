@@ -23,11 +23,13 @@ from .skill_install import validate as validate_skill
 from .sources import SourceWindow
 from .store import Store
 from .team_skills import TeamSkills
+from .project_validation import audit
 
 BINDING = "quote_topics.binding.v1"
 SNAPSHOT = "summary_knowledge.context.v1"
 KNOWLEDGE_TOOLS = (
     "knowledge_context",
+    "knowledge_project_audit",
     "knowledge_search",
     "knowledge_read",
     "knowledge_save",
@@ -208,6 +210,7 @@ class SummaryWriteKnowledgeSkill(Star):
             event.set_extra("summary_knowledge.window", SourceWindow(topic, maximum, attachments))
             event.set_extra("summary_knowledge.read_ids", set())
             req.system_prompt += "\n" + SYSTEM
+            req.system_prompt += "\n保存前必须调用 knowledge_project_audit；若引用链涉及多个项目，先按消息分段并询问用户，不能把整段内容归入最后提到的项目。保存工具会再次校验项目指纹；出现冲突时不得声称已保存。"
             req.system_prompt += "\n开始任务先用 native_skill_list 按平台和项目发现适用技能，再按 id 用 native_skill_read 读完整版本。未知项目先问，不能按群名或发言人推断。平台通用技能配合任务项目知识使用，报告注明所用技能名称和版本。工具按权限筛选，存在冲突不得混用。已有技能先检索，更新须读当前版本；其他作者技能可通过 team_skill_manage 提建议。知识来源目录包含当前附件、引用消息内已下载的附件及此前同话题缓存。用户要求同时沉淀方法与项目资料时，先找并完整读取实际文件，使用 knowledge_delivery 分别提交 skill 与 knowledge，结果逐项报告；失败仅用 delivery_id 继续未完成部分，不重生成成功 Skill、不重跑查询。获取文件先检查来源目录、task_artifacts 登记并导入，再检查引用文件，全部不可获取时才请求补发并说明原因。项目资料缺失不得默认降级全量查询，应询问补充资料或明确授权仅查已确认账户；映射执行前核对，历史统计标日期，取数失败不能当零。若正文只存在已生成的代码任务成果中，使用 knowledge_artifact_import 导入，再读取和选择来源，不根据生成代码猜正文。"
             req.system_prompt += "\n当前话题项目目录（数据）：" + json.dumps(
                 await self.service.context_catalog(topic), ensure_ascii=False
@@ -993,6 +996,17 @@ class SummaryWriteKnowledgeSkill(Star):
                 "attachment_notices": event.get_extra("summary_knowledge.attachment_notices", []),
                 **(await self.service.context_catalog(topic)),
             }
+
+        return await self.run_tool(event, action)
+
+    @filter.llm_tool(name="knowledge_project_audit")
+    async def knowledge_project_audit(self, event: AstrMessageEvent, project: str):
+        """在保存前检查引用会话是否始终属于指定项目，并返回可解释的证据和分段结果。"""
+
+        async def action():
+            topic = self.guard(event, write=False)
+            result = audit(topic, project, self.store.projects(), self.store.binding(topic.scope, topic.cid))
+            return {"status": "ok", **result.to_dict(), "message": "项目归属校验通过；保存时仍会再次复核。"}
 
         return await self.run_tool(event, action)
 
