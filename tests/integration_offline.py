@@ -524,6 +524,30 @@ async def main():
             )
             assert denied["status"] == "needs_attention", denied
 
+            # One part can fail while the other succeeds; resume never reinstalls Skill.
+            paired = {
+                "knowledge": {**data, "title": "组合任务知识", "content": "已确认的独立结论"},
+                "skill": {
+                    "name": "paired-skill",
+                    "content": body.replace("meta-query", "paired-skill"),
+                    "reason": "保存方法与项目资料",
+                },
+            }
+            chat.text_chat.side_effect = [
+                types.SimpleNamespace(completion_text='{"allow":false,"question":"补齐资料"}'),
+                types.SimpleNamespace(completion_text='{"allow":true,"explicit_project":true}'),
+            ]
+            partial = json.loads(await plugin.knowledge_delivery(install_evt, json.dumps(paired)))
+            chat.text_chat.side_effect = None
+            assert partial["status"] == "partial", partial
+            assert partial["parts"]["skill"]["status"] == "installed", partial
+            count = len(plugin.team_skills.catalog(plugin.team_identity(install_evt), []))
+            complete = json.loads(
+                await plugin.knowledge_delivery(install_evt, delivery_id=partial["delivery_id"])
+            )
+            assert complete["status"] == "complete", complete
+            assert len(plugin.team_skills.catalog(plugin.team_identity(install_evt), [])) == count
+
         finally:
             star_registry.remove(builtin)
         # An unavailable attachment is reported without disabling all history tools.
@@ -535,6 +559,23 @@ async def main():
         missing = json.loads(await plugin.knowledge_context(missing_evt))
         assert missing["attachment_notices"]
         assert missing["source_directory"]["selection_required"]
+
+        # Adapter-downloaded files nested in the genuine Reply are usable directly.
+        from astrbot.core.message.components import Reply
+
+        quoted_evt = event("quoted-file-request")
+        quoted_path = temp_path / "quoted.md"
+        quoted_path.write_text("引用文件全文", encoding="utf-8")
+        quoted_evt.message_obj.raw_message = {"parent_id": "old-file-mid"}
+        quoted_evt.message_obj.message.append(
+            Reply(id="old-file-mid", chain=[File(name="quoted.md", file=str(quoted_path))])
+        )
+        await prepare(quoted_evt)
+        quoted_files = plugin.team_skills.files(quoted_evt.get_extra(module.SNAPSHOT))
+        assert any(
+            f["name"] == "quoted.md" and f["source_message_id"] == "old-file-mid"
+            for f in quoted_files
+        )
 
         # Import an existing task artifact through its owner's checked API.
         from dataclasses import replace
@@ -557,6 +598,30 @@ async def main():
                 jobs=types.SimpleNamespace(artifact=artifact),
             ),
         )
+        from mcp.types import CallToolResult, TextContent
+
+        code_plugin = types.SimpleNamespace(
+            closed=False,
+            config={"enabled": True},
+            jobs=types.SimpleNamespace(
+                artifact=artifact,
+                get=lambda job, owner: {"state": "succeeded", "files": [{"name": "generated.md"}]},
+            ),
+        )
+        context.get_registered_star = lambda name: types.SimpleNamespace(
+            activated=True, star_cls=code_plugin
+        )
+        await plugin.register_artifact(
+            missing_evt,
+            types.SimpleNamespace(name="code_start", plugin=code_plugin),
+            {},
+            CallToolResult(
+                content=[TextContent(type="text", text='{"ok":true,"id":"fixture-job"}')]
+            ),
+        )
+        assert plugin.deliveries.file(imported_topic, "fixture-job", "generated.md")
+        # Original executor may now be unavailable: registered bytes still resolve.
+        context.get_registered_star = lambda name: None
         imported = json.loads(
             await plugin.knowledge_artifact_import(missing_evt, "fixture-job", "generated.md")
         )
@@ -567,7 +632,7 @@ async def main():
         )
 
         print(
-            "PASS: real AstrBot tools + Lark + SQLite + FAISS; long-topic selection/save, attachment sources, member team-skill install/update, review refusal, native isolation, artifact import, persona guards, versioned writes and restart. No network/live data."
+            "PASS: real AstrBot tools + Lark + SQLite + FAISS; long-topic selection/save, attachment sources, member team-skill install/update, review refusal, native isolation, private artifact registration/cache, quoted files, partial delivery/resume, persona guards, versioned writes and restart. No network/live data."
         )
     finally:
         await plugin.terminate()

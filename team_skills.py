@@ -22,6 +22,11 @@ class TeamSkills:
         CREATE TABLE IF NOT EXISTS team_skill_events(
           id TEXT PRIMARY KEY, skill_id TEXT NOT NULL, actor TEXT NOT NULL,
           kind TEXT NOT NULL, content TEXT NOT NULL, created TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS team_skill_ops(key TEXT PRIMARY KEY, id TEXT NOT NULL, version INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS private_topic_files(
+          scope TEXT NOT NULL, cid TEXT NOT NULL, owner TEXT NOT NULL, sha TEXT NOT NULL,
+          name TEXT NOT NULL, content TEXT NOT NULL, mid TEXT NOT NULL, created TEXT NOT NULL,
+          PRIMARY KEY(scope,cid,owner,sha));
         CREATE TABLE IF NOT EXISTS topic_files(
           scope TEXT NOT NULL, cid TEXT NOT NULL, sha TEXT NOT NULL,
           name TEXT NOT NULL, content TEXT NOT NULL, mid TEXT NOT NULL,
@@ -143,7 +148,20 @@ class TeamSkills:
             rows.append(self.public(r))
         return rows
 
-    def save(self, name, body, meta, who, projects, source, ident="", expected=0):
+    def save(self, name, body, meta, who, projects, source, ident="", expected=0, operation_key=""):
+        if operation_key:
+            prior = self.db.execute(
+                "SELECT id,version FROM team_skill_ops WHERE key=?", (operation_key,)
+            ).fetchone()
+            if prior:
+                r = self.get(prior["id"], who, projects, edit=True)
+                if r["version"] != prior["version"] or not r["active"]:
+                    raise KnowledgeError("原技能已保存但随后变化，请读取当前版本，不重复安装。")
+                return {
+                    "status": "installed",
+                    **self.public(r),
+                    "message": "此前已完成，未重复安装。",
+                }
         body = validate(name, body)
         import yaml
 
@@ -203,6 +221,10 @@ class TeamSkills:
             readback = self.row(ident)
             if readback["sha"] != sha or readback["body"] != body:
                 raise KnowledgeError("技能回读失败。")
+            if operation_key:
+                self.db.execute(
+                    "INSERT INTO team_skill_ops VALUES(?,?,?)", (operation_key, ident, version)
+                )
         return {
             "status": "installed",
             **self.public(readback),
@@ -294,13 +316,31 @@ class TeamSkills:
         with self.db:
             for f in files:
                 sha = hashlib.sha256(f["text"].encode()).hexdigest()
-                self.db.execute(
-                    "INSERT OR IGNORE INTO topic_files VALUES(?,?,?,?,?,?,?)",
-                    (topic.scope, topic.cid, sha, f["name"], f["text"], topic.message_id, utcnow()),
+                values = (
+                    topic.scope,
+                    topic.cid,
+                    sha,
+                    f["name"],
+                    f["text"],
+                    f.get("source_message_id", topic.message_id),
+                    utcnow(),
                 )
+                if f.get("_owner"):
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO private_topic_files(scope,cid,sha,name,content,mid,created,owner) VALUES(?,?,?,?,?,?,?,?)",
+                        (*values, f["_owner"]),
+                    )
+                else:
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO topic_files VALUES(?,?,?,?,?,?,?)", values
+                    )
             self.db.execute(
                 "DELETE FROM topic_files WHERE scope=? AND cid=? AND sha NOT IN (SELECT sha FROM topic_files WHERE scope=? AND cid=? ORDER BY rowid DESC LIMIT 30)",
                 (topic.scope, topic.cid, topic.scope, topic.cid),
+            )
+            self.db.execute(
+                "DELETE FROM private_topic_files WHERE scope=? AND cid=? AND owner=? AND sha NOT IN (SELECT sha FROM private_topic_files WHERE scope=? AND cid=? AND owner=? ORDER BY rowid DESC LIMIT 30)",
+                (topic.scope, topic.cid, topic.actor, topic.scope, topic.cid, topic.actor),
             )
 
     def files(self, topic):
@@ -312,7 +352,7 @@ class TeamSkills:
                 "source_message_id": r["mid"],
             }
             for r in self.db.execute(
-                "SELECT * FROM topic_files WHERE scope=? AND cid=? ORDER BY rowid DESC LIMIT 30",
-                (topic.scope, topic.cid),
+                "SELECT name,content,sha,mid,created FROM topic_files WHERE scope=? AND cid=? UNION ALL SELECT name,content,sha,mid,created FROM private_topic_files WHERE scope=? AND cid=? AND owner=? ORDER BY created DESC LIMIT 60",
+                (topic.scope, topic.cid, topic.scope, topic.cid, topic.actor),
             )
         ]

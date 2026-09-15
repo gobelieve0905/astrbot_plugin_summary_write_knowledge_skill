@@ -149,9 +149,9 @@ class Service:
             "obsolete_index_cleanup_pending": cleanup_pending,
         }
 
-    async def save(self, topic, plan: Plan, review):
+    async def save(self, topic, plan: Plan, review, operation_key=""):
         async with self.lock:
-            op = digest([topic.scope, topic.message_id, plan.to_dict()])
+            op = digest([topic.scope, operation_key or topic.message_id, plan.to_dict()])
             prior = self.store.operation(op)
             if prior and prior["state"] == "active":
                 # Even retries must prove storage remains usable.

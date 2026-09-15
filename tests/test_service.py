@@ -247,6 +247,14 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(models.KnowledgeError):
             await self.save()
 
+    async def test_delivery_key_survives_new_message_without_duplicate(self):
+        first = await self.service.save(topic(), plan(), allow, operation_key="delivery:knowledge")
+        second = await self.service.save(
+            topic(mid="continue"), plan(), allow, operation_key="delivery:knowledge"
+        )
+        self.assertEqual(first["record_id"], second["record_id"])
+        self.assertEqual(self.backend.uploads, 1)
+
 
 class ValidationTests(unittest.TestCase):
     def test_path_traversal_record_id(self):

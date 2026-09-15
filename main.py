@@ -12,6 +12,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
 from .backend import AstrBotBackend
+from .deliveries import Deliveries
 from .directory import ChoiceDirectory, normalize_config
 from .models import KnowledgeError, Plan, TopicContext, text
 from .native_skills import available_skills, read_text_resource, skill_root
@@ -33,6 +34,7 @@ KNOWLEDGE_TOOLS = (
     "knowledge_source_read",
     "knowledge_source_select",
     "knowledge_artifact_import",
+    "knowledge_delivery",
 )
 SKILL_TOOLS = (
     "native_skill_list",
@@ -81,6 +83,9 @@ class SummaryWriteKnowledgeSkill(Star):
         self.service = Service(self.store, AstrBotBackend(context, service_config), service_config)
         self.directory = ChoiceDirectory(context, config, self.store.root / "directory.json")
         self.team_skills = TeamSkills(self.store)
+        self.deliveries = Deliveries(self.store)
+        self.delivery_lock = asyncio.Lock()
+        self.artifact_task = None
         self.web_handlers = []
         if hasattr(context, "register_web_api"):
             for route, handler, methods in (
@@ -100,6 +105,7 @@ class SummaryWriteKnowledgeSkill(Star):
 
     async def initialize(self):
         await self.directory.start()
+        self.artifact_task = asyncio.create_task(self.watch_artifacts())
 
     def enabled(self, event):
         if self.closed or not self.config.get("enabled", False):
@@ -200,7 +206,7 @@ class SummaryWriteKnowledgeSkill(Star):
             event.set_extra("summary_knowledge.window", SourceWindow(topic, maximum, attachments))
             event.set_extra("summary_knowledge.read_ids", set())
             req.system_prompt += "\n" + SYSTEM
-            req.system_prompt += "\n开始任务先用 native_skill_list 按平台和项目发现适用技能，再按 id 用 native_skill_read 读完整版本。未知项目先问，不能按群名或发言人推断。平台通用技能配合任务项目知识使用，报告注明所用技能名称和版本。工具按权限筛选，存在冲突不得混用。已有技能先检索，更新须读当前版本；其他作者技能可通过 team_skill_manage 提建议。知识来源目录包含此前同一话题已读取并缓存的附件。若正文只存在已生成的代码任务成果中，使用 knowledge_artifact_import 导入，再读取和选择来源，不根据生成代码猜正文。"
+            req.system_prompt += "\n开始任务先用 native_skill_list 按平台和项目发现适用技能，再按 id 用 native_skill_read 读完整版本。未知项目先问，不能按群名或发言人推断。平台通用技能配合任务项目知识使用，报告注明所用技能名称和版本。工具按权限筛选，存在冲突不得混用。已有技能先检索，更新须读当前版本；其他作者技能可通过 team_skill_manage 提建议。知识来源目录包含当前附件、引用消息内已下载的附件及此前同话题缓存。用户要求同时沉淀方法与项目资料时，先找并完整读取实际文件，使用 knowledge_delivery 分别提交 skill 与 knowledge，结果逐项报告；失败仅用 delivery_id 继续未完成部分，不重生成成功 Skill、不重跑查询。获取文件先检查来源目录、task_artifacts 登记并导入，再检查引用文件，全部不可获取时才请求补发并说明原因。项目资料缺失不得默认降级全量查询，应询问补充资料或明确授权仅查已确认账户；映射执行前核对，历史统计标日期，取数失败不能当零。若正文只存在已生成的代码任务成果中，使用 knowledge_artifact_import 导入，再读取和选择来源，不根据生成代码猜正文。"
             req.system_prompt += "\n当前话题项目目录（数据）：" + json.dumps(
                 await self.service.context_catalog(topic), ensure_ascii=False
             )
@@ -262,13 +268,19 @@ class SummaryWriteKnowledgeSkill(Star):
             self.active.discard(task)
 
     def current_attachments(self, event):
-        from astrbot.core.message.components import File
+        from astrbot.core.message.components import File, Reply
         from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
         root = Path(get_astrbot_temp_path()).resolve()
         result, notices = [], []
         event.set_extra("summary_knowledge.attachment_notices", notices)
-        for component in event.message_obj.message:
+        components = [(x, str(event.message_obj.message_id)) for x in event.message_obj.message]
+        for x in event.message_obj.message:
+            if isinstance(x, Reply) and str(x.id) == str(
+                getattr(event.get_extra(SNAPSHOT), "quoted_message_id", "")
+            ):
+                components.extend((c, str(x.id)) for c in (x.chain or []) if isinstance(c, File))
+        for component, source_mid in components:
             if not isinstance(component, File) or Path(component.name or "").suffix.lower() not in {
                 ".md",
                 ".txt",
@@ -292,7 +304,14 @@ class SummaryWriteKnowledgeSkill(Star):
                         raise KnowledgeError("附件在读取期间发生变化，请重新发送。")
                     data = more
                     body += data["content"]
-                result.append({"name": component.name, "text": body, "file_sha256": data["sha256"]})
+                result.append(
+                    {
+                        "name": component.name,
+                        "text": body,
+                        "file_sha256": data["sha256"],
+                        "source_message_id": source_mid,
+                    }
+                )
             except KnowledgeError as exc:
                 notices.append(str(exc))
         return result
@@ -556,6 +575,7 @@ class SummaryWriteKnowledgeSkill(Star):
                 source,
                 skill_id,
                 expected_version,
+                operation_key=event.get_extra("summary_knowledge.delivery_key", ""),
             )
             event.set_extra("summary_knowledge.native_install_receipt", result)
             return result
@@ -621,6 +641,10 @@ class SummaryWriteKnowledgeSkill(Star):
             {
                 "skills": self.team_skills.catalog(who, [], include_disabled=True),
                 "projects": [p["name"] for p in self.store.projects()],
+                "deliveries": self.deliveries.admin_status(),
+                "artifact_monitor_running": bool(
+                    self.artifact_task and not self.artifact_task.done()
+                ),
             }
         )
 
@@ -684,50 +708,146 @@ class SummaryWriteKnowledgeSkill(Star):
         except (KnowledgeError, KeyError, TypeError, ValueError) as exc:
             return error_response(str(exc))
 
+    def code_jobs(self):
+        get = getattr(self.context, "get_registered_star", None)
+        registry = get("astrbot_plugin_code_running") if get else None
+        if (
+            not registry
+            or not registry.activated
+            or not registry.star_cls
+            or registry.star_cls.closed
+            or not registry.star_cls.config.get("enabled", True)
+        ):
+            return None
+        return registry.star_cls
+
+    @staticmethod
+    def artifact_text(path):
+        data = read_text_resource(path.parent, path.name, 0, 32000)
+        body, sha = data["content"], data["sha256"]
+        while data["next_offset"] is not None:
+            data = read_text_resource(path.parent, path.name, data["next_offset"], 32000)
+            if data["sha256"] != sha:
+                raise KnowledgeError("成果读取期间变化。")
+            body += data["content"]
+        return body
+
+    def collect_artifact(self, row):
+        plugin = self.code_jobs()
+        if plugin is None:
+            return
+        try:
+            record = plugin.jobs.get(row["job"], row["owner"])
+        except ValueError:
+            self.deliveries.finish(
+                row["job"], "unavailable", "原任务不存在、已过期或读取权限已变化。"
+            )
+            return
+        if record["state"] == "running":
+            return
+        files = []
+        errors = []
+        for item in record.get("files", [])[:25]:
+            name = item.get("name", "")
+            if Path(name).suffix.lower() not in {".md", ".txt"}:
+                continue
+            try:
+                path = plugin.jobs.artifact(row["job"], name, row["owner"])
+                files.append({"name": name, "body": self.artifact_text(path)})
+            except (ValueError, OSError, KnowledgeError):
+                errors.append("部分文本成果无法读取或超过 1 MiB。")
+        detail = "任务状态：" + str(record["state"]) + "。" + (" ".join(errors))
+        self.deliveries.finish(row["job"], "ready" if files else "empty", detail, files)
+
+    async def watch_artifacts(self):
+        while not self.closed:
+            try:
+                for row in self.deliveries.jobs():
+                    self.collect_artifact(row)
+            except Exception as exc:
+                logger.warning("成果登记检查失败：%s", type(exc).__name__)
+            await asyncio.sleep(5)
+
+    @filter.on_llm_tool_respond()
+    async def register_artifact(self, event, tool, tool_args, tool_result):
+        if not self.enabled(event) or getattr(tool, "name", "") not in {
+            "code_start",
+            "code_status",
+            "code_file",
+        }:
+            return
+        plugin = self.code_jobs()
+        if plugin is None or getattr(tool, "plugin", None) is not plugin:
+            return
+        try:
+            import hashlib
+
+            topic = self.guard(event)
+            owner = hashlib.sha256(
+                (str(event.unified_msg_origin) + "\0" + str(event.get_sender_id())).encode()
+            ).hexdigest()
+            args = tool_args or {}
+            job = args.get("job_id", "")
+            if tool.name == "code_start":
+                for c in getattr(tool_result, "content", None) or []:
+                    if getattr(c, "type", "") == "text":
+                        data = json.loads(c.text)
+                        if isinstance(data, dict) and data.get("ok") is True:
+                            job = data.get("id", "")
+            if not job:
+                return
+            plugin.jobs.get(job, owner)
+            self.deliveries.register(topic, job, owner)
+            for row in self.deliveries.jobs():
+                if row["job"] == job:
+                    self.collect_artifact(row)
+        except (KnowledgeError, ValueError, TypeError, AttributeError):
+            # Registration cannot turn a successful query into a failed user answer.
+            return
+
     @filter.llm_tool(name="knowledge_artifact_import")
     async def knowledge_artifact_import(self, event: AstrMessageEvent, job_id: str, name: str):
-        """将已有隔离代码任务的 Markdown/TXT 成果加入当前话题来源，不重新运行任务；保留原插件的文件所有者权限。
+        """先从本人同话题的成果登记取回文件，再尝试原任务；不重跑查询、不读取他人私有任务。
 
         Args:
-            job_id(string): 当前话题中代码任务返回的真实任务 ID。
-            name(string): 任务结果中的文件名，限 Markdown/TXT。
+            job_id(string): knowledge_context 成果目录或本话题真实任务 ID。
+            name(string): Markdown/TXT 文件名。
         """
 
         async def action():
             import hashlib
 
             topic = self.guard(event, write=True)
-            registry = self.context.get_registered_star("astrbot_plugin_code_running")
-            if (
-                not registry
-                or not registry.activated
-                or not registry.star_cls
-                or registry.star_cls.closed
-                or not registry.star_cls.config.get("enabled", True)
-            ):
-                raise KnowledgeError("代码执行插件不可用，请直接附上文件。")
             if Path(name).suffix.lower() not in {".md", ".txt"}:
-                raise KnowledgeError("仅导入 Markdown/TXT 成果。")
-            if not job_id or job_id not in json.dumps(topic.to_dict(), ensure_ascii=False):
-                raise KnowledgeError("当前话题未包含此任务 ID，请引用对应任务。")
-            owner = hashlib.sha256(
-                (str(event.unified_msg_origin) + "\0" + str(event.get_sender_id())).encode()
-            ).hexdigest()
-            try:
-                path = registry.star_cls.jobs.artifact(job_id, name, owner)
-                data = read_text_resource(path.parent, path.name, 0, 32000)
-                body = data["content"]
-                sha = data["sha256"]
-                while data["next_offset"] is not None:
-                    data = read_text_resource(path.parent, path.name, data["next_offset"], 32000)
-                    if data["sha256"] != sha:
-                        raise KnowledgeError("成果读取期间变化。")
-                    body += data["content"]
-            except (ValueError, OSError):
-                raise KnowledgeError(
-                    "成果不存在、已过期或原任务不允许当前用户读取，请由有权限的成员附上文件。"
-                ) from None
-            self.team_skills.cache_files(topic, [{"name": name, "text": body}])
+                raise KnowledgeError("仅导入 Markdown/TXT。")
+            cached = self.deliveries.file(topic, job_id, name)
+            if cached:
+                body = cached["body"]
+            else:
+                if not job_id or (
+                    job_id not in {r["job"] for r in self.deliveries.catalog(topic)}
+                    and job_id not in json.dumps(topic.to_dict(), ensure_ascii=False)
+                ):
+                    raise KnowledgeError(
+                        "未找到本话题可读取的成果登记或任务 ID，请引用对应文件消息。"
+                    )
+                plugin = self.code_jobs()
+                if plugin is None:
+                    raise KnowledgeError(
+                        "成果缓存没有该文件，原任务插件不可用；可引用文件消息或补发附件。"
+                    )
+                owner = hashlib.sha256(
+                    (str(event.unified_msg_origin) + "\0" + str(event.get_sender_id())).encode()
+                ).hexdigest()
+                try:
+                    body = self.artifact_text(plugin.jobs.artifact(job_id, name, owner))
+                except (ValueError, OSError):
+                    raise KnowledgeError(
+                        "缓存无此文件，原任务不存在、已过期或无读取权限。请引用文件消息；仍无法获取时由有权限成员补发。"
+                    ) from None
+            self.team_skills.cache_files(
+                topic, [{"name": name, "text": body, "_owner": topic.actor}]
+            )
             event.set_extra(
                 "summary_knowledge.window",
                 SourceWindow(
@@ -739,11 +859,94 @@ class SummaryWriteKnowledgeSkill(Star):
             event.set_extra("summary_knowledge.context_read", False)
             return {
                 "status": "imported",
-                "message": "成果已加入话题来源，请重新读取 knowledge_context、全文读取并选择后保存。",
-                "sha256": sha,
+                "sha256": hashlib.sha256(body.encode()).hexdigest(),
+                "message": "真实文件已取回，仅本人可读；重新读取来源目录并选定全文后保存。入项目库仍需明确项目共享意图。",
             }
 
         return await self.run_tool(event, action)
+
+    @filter.llm_tool(name="knowledge_delivery")
+    async def knowledge_delivery(
+        self,
+        event: AstrMessageEvent,
+        plan_json: str = "",
+        delivery_id: str = "",
+        action: str = "save",
+    ):
+        """分别保存 Skill 与项目知识并持久记录各自回执；部分失败只重试未完成部分，不重跑查询。
+
+        Args:
+            plan_json(string): 新任务 JSON，skill 对象是 native_skill_install 参数（不含 event），knowledge 对象是 knowledge_save 的计划；继续时可仅提供未完成部分的完整修正计划。
+            delivery_id(string): 继续或查询已有任务的 ID；不改计划时留空 plan_json。
+            action(string): save 创建或继续保存；status 仅查看结果。先读取并选定真实来源，知识更新和技能更新仍须读旧版。
+        """
+
+        async def operation():
+            topic = self.guard(event, write=action != "status")
+            if action not in ("save", "status"):
+                raise KnowledgeError("action 只能为 save/status。")
+            if delivery_id:
+                row = self.deliveries.bundle(topic, delivery_id)
+            else:
+                if action == "status":
+                    return {"status": "ok", "deliveries": self.deliveries.recent(topic)}
+                try:
+                    plan = json.loads(plan_json)
+                except ValueError:
+                    raise KnowledgeError("计划 JSON 无效。") from None
+                row = self.deliveries.create(topic, plan)
+            ident = row["id"]
+            if action == "status":
+                return self.deliveries.status(topic, ident)
+            async with self.delivery_lock:
+                if delivery_id and plan_json:
+                    try:
+                        patch = json.loads(plan_json)
+                    except ValueError:
+                        raise KnowledgeError("修正计划 JSON 无效。") from None
+                    self.deliveries.amend(topic, ident, patch)
+                row = self.deliveries.bundle(topic, ident)
+                previous = event.get_extra("summary_knowledge.delivery_key", "")
+                try:
+                    for part in ("knowledge", "skill"):
+                        if part not in row["plan"] or row["states"][part].get("status") in (
+                            "saved",
+                            "installed",
+                        ):
+                            continue
+                        event.set_extra("summary_knowledge.delivery_key", ident + ":" + part)
+                        if part == "knowledge":
+                            raw = await self.knowledge_save(
+                                event, json.dumps(row["plan"][part], ensure_ascii=False)
+                            )
+                        else:
+                            args = row["plan"][part]
+                            if set(args) - {
+                                "name",
+                                "content",
+                                "reason",
+                                "expected_sha256",
+                                "metadata_json",
+                                "skill_id",
+                                "expected_version",
+                            } or not {"name", "content", "reason"} <= set(args):
+                                raw = json.dumps(
+                                    {
+                                        "status": "needs_attention",
+                                        "message": "skill 参数不完整或包含未知字段。",
+                                    }
+                                )
+                            else:
+                                raw = await self.native_skill_install(event, **args)
+                        result = json.loads(raw)
+                        self.deliveries.record(topic, ident, part, result)
+                finally:
+                    event.set_extra("summary_knowledge.delivery_key", previous)
+            result = self.deliveries.status(topic, ident)
+            event.set_extra("summary_knowledge.delivery_result", result)
+            return result
+
+        return await self.run_tool(event, operation)
 
     @filter.llm_tool(name="knowledge_context")
     async def knowledge_context(self, event: AstrMessageEvent, offset: int = 0):
@@ -766,6 +969,8 @@ class SummaryWriteKnowledgeSkill(Star):
             return {
                 "topic": shown.to_dict(),
                 "source_directory": window.directory(offset),
+                "task_artifacts": self.deliveries.catalog(topic),
+                "deliveries": self.deliveries.recent(topic),
                 "attachment_notices": event.get_extra("summary_knowledge.attachment_notices", []),
                 **(await self.service.context_catalog(topic)),
             }
@@ -906,7 +1111,12 @@ class SummaryWriteKnowledgeSkill(Star):
                     )
                 return result
 
-            result = await self.service.save(topic, plan, review)
+            result = await self.service.save(
+                topic,
+                plan,
+                review,
+                operation_key=event.get_extra("summary_knowledge.delivery_key", ""),
+            )
             receipts = event.get_extra("summary_knowledge.receipts", [])
             receipts.append(result)
             event.set_extra("summary_knowledge.receipts", receipts)
@@ -929,6 +1139,26 @@ class SummaryWriteKnowledgeSkill(Star):
                 skill_saved=bool(event.get_extra("summary_knowledge.native_install_receipt")),
             )
 
+        delivery = event.get_extra("summary_knowledge.delivery_result")
+        if delivery and delivery["status"] == "partial":
+            labels = {"skill": "Skill", "knowledge": "项目知识"}
+            lines = [
+                labels[k]
+                + (
+                    "：已完成。"
+                    if v.get("status") in ("saved", "installed")
+                    else "：未完成，" + str(v.get("message", "待处理"))[:250]
+                )
+                for k, v in delivery["parts"].items()
+            ]
+            response.completion_text = (
+                (response.completion_text or "")
+                + "\n\n本次沉淀回执：\n"
+                + "\n".join(lines)
+                + "\n继续任务 ID："
+                + delivery["delivery_id"]
+            )
+
     @filter.command("知识管理状态")
     async def status(self, event: AstrMessageEvent):
         state = "已启用" if self.enabled(event) else "未启用"
@@ -938,6 +1168,9 @@ class SummaryWriteKnowledgeSkill(Star):
 
     async def terminate(self):
         self.closed = True
+        if self.artifact_task:
+            self.artifact_task.cancel()
+            await asyncio.gather(self.artifact_task, return_exceptions=True)
         await self.directory.close()
         tasks = [t for t in self.active if t is not asyncio.current_task()]
         if tasks:
