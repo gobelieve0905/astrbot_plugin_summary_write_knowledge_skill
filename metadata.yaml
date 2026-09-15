@@ -1,8 +1,8 @@
 name: astrbot_plugin_summary_write_knowledge_skill
-display_name: 话题知识沉淀
-short_desc: 将引用话题沉淀为项目知识、规则和 Skill
+display_name: 团队知识与技能
+short_desc: 团队知识沉淀与分组技能协作
 desc: 根据引用话题整理长期知识，按项目与平台管理版本，复用现有嵌入和重排序模型，文件及索引验证成功后确认保存。需要引用续聊插件；默认关闭。
-version: 0.0.0
+version: 0.1.0
 author: gobelieve
 category: 工具
 astrbot_version: '>=4.28.0,<4.28.2'

@@ -464,7 +464,7 @@ async def main():
                 False,
             )
             install_evt = event("native-install")
-            install_evt.role = "admin"
+            install_evt.role = "member"
             await prepare(install_evt)
             page = json.loads(await plugin.native_skill_read(install_evt, "skill-creator"))
             while page["next_offset"] is not None:
@@ -478,14 +478,46 @@ async def main():
                 await plugin.native_skill_install(install_evt, "meta-query", body, "用户要求安装")
             )
             assert installed["status"] == "installed", installed
-            readback = json.loads(await plugin.native_skill_read(install_evt, "meta-query"))
+            # Team installation does not expose the file in the global native directory.
+            assert not any(
+                x.name == "meta-query" for x in manager.list_skills(show_sandbox_path=False)
+            )
+            saved_response = LLMResponse(role="assistant", completion_text="技能已启用。")
+            await plugin.protect_receipt(install_evt, saved_response)
+            assert saved_response.completion_text == "技能已启用。"
+            readback = json.loads(await plugin.native_skill_read(install_evt, installed["id"]))
             assert readback["content"] == body, readback
             updated = json.loads(
                 await plugin.native_skill_install(
-                    install_evt, "meta-query", body + "核对时区。", "更新规范", readback["sha256"]
+                    install_evt,
+                    "meta-query",
+                    body + "核对时区。",
+                    "更新规范",
+                    readback["sha256"],
+                    skill_id=installed["id"],
+                    expected_version=1,
                 )
             )
             assert updated["status"] == "installed", updated
+            chat.text_chat.return_value = types.SimpleNamespace(
+                completion_text='{"allow":false,"question":"未明确共享"}'
+            )
+            rejected = json.loads(
+                await plugin.native_skill_install(
+                    install_evt,
+                    "another-skill",
+                    body.replace("meta-query", "another-skill"),
+                    "安装",
+                )
+            )
+            assert rejected["status"] == "needs_attention"
+            assert not any(
+                r["name"] == "another-skill"
+                for r in plugin.team_skills.catalog(plugin.team_identity(install_evt), [])
+            )
+            chat.text_chat.return_value = types.SimpleNamespace(
+                completion_text='{"allow":true,"explicit_project":true}'
+            )
             install_evt.role = "member"
             denied = json.loads(
                 await plugin.native_skill_install(install_evt, "meta-query", body, "安装")
@@ -504,8 +536,38 @@ async def main():
         assert missing["attachment_notices"]
         assert missing["source_directory"]["selection_required"]
 
+        # Import an existing task artifact through its owner's checked API.
+        from dataclasses import replace
+
+        original = missing_evt.get_extra(module.SNAPSHOT)
+        imported_topic = replace(original, request=original.request + " 导入任务 fixture-job")
+        missing_evt.set_extra(module.SNAPSHOT, imported_topic)
+        result_file = temp_path / "generated.md"
+        result_file.write_text("已确认的任务结果全文", encoding="utf-8")
+
+        def artifact(job_id, name, owner):
+            assert job_id == "fixture-job" and name == "generated.md" and len(owner) == 64
+            return result_file
+
+        context.get_registered_star = lambda name: types.SimpleNamespace(
+            activated=True,
+            star_cls=types.SimpleNamespace(
+                closed=False,
+                config={"enabled": True},
+                jobs=types.SimpleNamespace(artifact=artifact),
+            ),
+        )
+        imported = json.loads(
+            await plugin.knowledge_artifact_import(missing_evt, "fixture-job", "generated.md")
+        )
+        assert imported["status"] == "imported", imported
+        assert not missing_evt.get_extra("summary_knowledge.context_read")
+        assert any(
+            f["text"] == "已确认的任务结果全文" for f in plugin.team_skills.files(imported_topic)
+        )
+
         print(
-            "PASS: real AstrBot tools + Lark + SQLite + FAISS; long-topic selection/save, attachment sources, built-in skill-creator reading, persona/activation guards, versioned writes and restart. No network/live data."
+            "PASS: real AstrBot tools + Lark + SQLite + FAISS; long-topic selection/save, attachment sources, member team-skill install/update, review refusal, native isolation, artifact import, persona guards, versioned writes and restart. No network/live data."
         )
     finally:
         await plugin.terminate()

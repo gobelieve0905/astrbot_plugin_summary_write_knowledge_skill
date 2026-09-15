@@ -10,7 +10,7 @@ NEGATED = re.compile(
 NOTICE = "本次没有成功的知识写入回执，尚不能确认知识已保存。"
 
 
-def protect_knowledge_claims(completion, *, write_attempted=False):
+def protect_knowledge_claims(completion, *, write_attempted=False, skill_saved=False):
     # Keep code blocks, quoted examples and all non-knowledge text verbatim.
     parts = re.split(r"(```[\s\S]*?```)", completion)
     for index in range(0, len(parts), 2):
@@ -20,6 +20,8 @@ def protect_knowledge_claims(completion, *, write_attempted=False):
                 continue
             match = CLAIM.search(sentence)
             if not match or NEGATED.search(sentence[: match.start()]):
+                continue
+            if skill_saved and match.group() == "技能已启用":
                 continue
             if not (KNOWLEDGE.search(sentence) or write_attempted):
                 continue
