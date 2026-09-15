@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime, timezone
 
 
@@ -42,6 +43,8 @@ class TopicContext:
     source_messages: list
     quoted_message_id: str = ""
     coverage: str = "仅 AstrBot 已登记的话题历史和当前消息；不保证包含未触发机器人的群聊发言。"
+
+    selection: dict = dataclass_field(default_factory=dict)
 
     def to_dict(self):
         return asdict(self)

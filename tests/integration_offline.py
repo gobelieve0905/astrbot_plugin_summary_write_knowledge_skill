@@ -334,8 +334,143 @@ async def main():
             await plugin.knowledge_search(restarted, "Idol Empire", "AppLovin", "归因")
         )
         assert found["results"], found
+        # Long topics remain usable: no implicit truncation and no review before selection.
+        long_evt = event("long-topic")
+        long_cid = await conversations.new_conversation(owner, long_evt.get_platform_id())
+        await conversations.update_conversation(
+            owner,
+            long_cid,
+            history=[
+                {"role": "tool", "content": "synthetic-tool-result " * 18000},
+                {"role": "user", "content": "确认 Idol Empire 的 AppLovin 标准：先核对样本。"},
+            ],
+        )
+        await prepare(long_evt, long_cid)
+        overview = json.loads(await plugin.knowledge_context(long_evt))
+        assert overview["source_directory"]["selection_required"]
+        assert not overview["topic"]["history"]
+        plan_long = {**data, "title": "长话题选定标准"}
+        calls = chat.text_chat.await_count
+        blocked = json.loads(await plugin.knowledge_save(long_evt, json.dumps(plan_long)))
+        assert blocked["status"] == "needs_attention"
+        assert chat.text_chat.await_count == calls
+        fragment = json.loads(await plugin.knowledge_source_read(long_evt, "h:1"))
+        spans = json.dumps([{"id": "h:1", "start": 0, "end": fragment["end"]}])
+        selection = json.loads(
+            await plugin.knowledge_source_select(
+                long_evt,
+                overview["source_directory"]["snapshot"],
+                spans,
+                "用户仅要求保存已确认标准",
+            )
+        )
+        assert selection["status"] == "selected", selection
+        result = json.loads(await plugin.knowledge_save(long_evt, json.dumps(plan_long)))
+        assert result["status"] == "saved", result
+        reviewed = json.loads(chat.text_chat.call_args.kwargs["prompt"])
+        assert "synthetic-tool-result" not in json.dumps(reviewed)
+        assert reviewed["topic"]["request"] == long_evt.message_str
+        snap = (
+            plugin.store.root
+            / "source-snapshots"
+            / (overview["source_directory"]["snapshot"] + ".json")
+        )
+        assert "synthetic-tool-result" in snap.read_text()
+        row = plugin.store.active(result["record_id"])
+        assert "synthetic-tool-result" not in plugin.service.checked_body(row)
+        assert json.loads(row["source"])["selection"]["ranges"][0]["id"] == "h:1"
+
+        # A newly attached file can be selected even when the original topic is huge.
+        from astrbot.core.message.components import File
+        from astrbot.core.utils.astrbot_path import get_astrbot_skills_path, get_astrbot_temp_path
+
+        temp_path = Path(get_astrbot_temp_path())
+        temp_path.mkdir(parents=True, exist_ok=True)
+        attached = temp_path / "project.md"
+        attached.write_text("Idol Empire / AppLovin：先核对样本。")
+        file_evt = event("file-source")
+        file_evt.message_obj.message.append(File(name="project.md", file=str(attached)))
+        await prepare(file_evt, long_cid)
+        overview = json.loads(await plugin.knowledge_context(file_evt))
+        assert any(x["id"] == "a:0" for x in overview["source_directory"]["sources"])
+        fragment = json.loads(await plugin.knowledge_source_read(file_evt, "a:0"))
+        assert fragment["text"] == attached.read_text()
+
+        # Real native SkillManager, persona filtering and enabled-state checks without CUA.
+        skills_path = Path(get_astrbot_skills_path())
+        skill_dir = skills_path / "fixture-reader"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: fixture-reader\ndescription: offline fixture\n---\nRead the task inputs first."
+        )
+        settings = {"provider_settings": {"computer_use_runtime": "none"}}
+        context.get_config = lambda **kwargs: settings
+        context.persona_manager = types.SimpleNamespace(
+            resolve_selected_persona=AsyncMock(
+                return_value=("fixture", {"skills": ["fixture-reader"]}, None, False)
+            )
+        )
+        skill_evt = event("skill-without-topic")
+        await plugin.prepare(skill_evt, ProviderRequest(prompt="读取技能"))
+        skill_list = json.loads(await plugin.native_skill_list(skill_evt))
+        assert [x["name"] for x in skill_list["skills"]] == ["fixture-reader"], skill_list
+        skill_text = json.loads(await plugin.native_skill_read(skill_evt, "fixture-reader"))
+        assert skill_text["complete"] and "Read the task" in skill_text["content"], skill_text
+        context.persona_manager.resolve_selected_persona.return_value = (
+            "fixture",
+            {"skills": []},
+            None,
+            False,
+        )
+        denied = json.loads(await plugin.native_skill_read(skill_evt, "fixture-reader"))
+        assert denied["status"] == "needs_attention", denied
+        context.persona_manager.resolve_selected_persona.return_value = (
+            "fixture",
+            {"skills": ["fixture-reader"]},
+            None,
+            False,
+        )
+        from astrbot.core.skills import SkillManager
+
+        manager = SkillManager()
+        cfg_path = Path(manager.config_path)
+        skill_cfg = json.loads(cfg_path.read_text())
+        skill_cfg["skills"]["fixture-reader"]["active"] = False
+        cfg_path.write_text(json.dumps(skill_cfg))
+        denied = json.loads(await plugin.native_skill_read(skill_evt, "fixture-reader"))
+        assert denied["status"] == "needs_attention", denied
+
+        # Built-in skill-creator is read through the same real tool (no fixture content).
+        from astrbot.core.star.star import star_registry
+
+        builtin = types.SimpleNamespace(
+            root_dir_name="astrbot", name="astrbot", activated=True, reserved=True
+        )
+        star_registry.append(builtin)
+        try:
+            context.persona_manager.resolve_selected_persona.return_value = (
+                "fixture",
+                {"skills": ["skill-creator"]},
+                None,
+                False,
+            )
+            actual = json.loads(await plugin.native_skill_read(skill_evt, "skill-creator"))
+            assert actual["status"] == "ok" and "skill" in actual["content"].lower(), actual
+            assert actual["total_chars"] > 1000
+        finally:
+            star_registry.remove(builtin)
+        # An unavailable attachment is reported without disabling all history tools.
+        missing_evt = event("missing-file")
+        missing_evt.message_obj.message.append(
+            File(name="missing.md", file=str(temp_path / "missing.md"))
+        )
+        await prepare(missing_evt, long_cid)
+        missing = json.loads(await plugin.knowledge_context(missing_evt))
+        assert missing["attachment_notices"]
+        assert missing["source_directory"]["selection_required"]
+
         print(
-            "PASS: real AstrBot 4.28.0 tools + Lark + Markdown parsing + SQLite + FAISS; template model reuse, write/read/update, platform filtering, reranking, Skill loading, restart. No network/live data."
+            "PASS: real AstrBot tools + Lark + SQLite + FAISS; long-topic selection/save, attachment sources, built-in skill-creator reading, persona/activation guards, versioned writes and restart. No network/live data."
         )
     finally:
         await plugin.terminate()

@@ -54,8 +54,8 @@
   "max_topic_chars": {
     "type": "int",
     "default": 100000,
-    "description": "话题历史上限（字符）",
-    "hint": "默认 100000 字符。超过上限会明确提示失败，不会静默截断话题后保存。"
+    "description": "单次整理上限（字符）",
+    "hint": "默认 100000 字符，限制单次选定的整理内容。长话题可分页读取并选择消息或 Markdown/TXT 附件，不会自动截断或禁用知识工具。"
   },
   "max_index_chunks": {
     "type": "int",

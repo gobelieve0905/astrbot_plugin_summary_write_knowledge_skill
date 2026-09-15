@@ -236,6 +236,7 @@ class Service:
                     "quoted_message_id": topic.quoted_message_id,
                     "actor": topic.actor,
                     "coverage": topic.coverage,
+                    "selection": topic.selection,
                     "snapshot_sha256": digest(topic.to_dict()),
                     "source_messages": [
                         {k: m[k] for k in ("mid", "actor", "created") if k in m}

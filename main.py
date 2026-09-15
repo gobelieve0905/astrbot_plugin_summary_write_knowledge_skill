@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
+from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -12,14 +14,25 @@ from astrbot.api.star import Context, Star, StarTools
 from .backend import AstrBotBackend
 from .directory import ChoiceDirectory, normalize_config
 from .models import KnowledgeError, Plan, TopicContext, text
+from .native_skills import available_skills, read_text_resource, skill_root
 from .prompts import REVIEW, SYSTEM
 from .receipts import protect_knowledge_claims
-from .service import Service
+from .service import Service, write_atomic
+from .sources import SourceWindow
 from .store import Store
 
 BINDING = "quote_topics.binding.v1"
 SNAPSHOT = "summary_knowledge.context.v1"
-TOOLS = ("knowledge_context", "knowledge_search", "knowledge_read", "knowledge_save")
+KNOWLEDGE_TOOLS = (
+    "knowledge_context",
+    "knowledge_search",
+    "knowledge_read",
+    "knowledge_save",
+    "knowledge_source_read",
+    "knowledge_source_select",
+)
+SKILL_TOOLS = ("native_skill_list", "native_skill_read")
+TOOLS = KNOWLEDGE_TOOLS + SKILL_TOOLS
 
 
 def scope_of(event):
@@ -107,6 +120,11 @@ class SummaryWriteKnowledgeSkill(Star):
     @filter.on_llm_request(priority=-20000)
     async def prepare(self, event: AstrMessageEvent, req):
         self.directory.observe(event)
+        event.set_extra("summary_knowledge.skill_ready", True)
+        event.set_extra(
+            "summary_knowledge.persona_id", getattr(req.conversation, "persona_id", None)
+        )
+        event.set_extra("summary_knowledge.window", None)
         event.set_extra(SNAPSHOT, None)
         event.set_extra("summary_knowledge.context_read", False)
         if not self.enabled(event):
@@ -114,10 +132,11 @@ class SummaryWriteKnowledgeSkill(Star):
                 for name in TOOLS:
                     req.func_tool.remove_tool(name)
             return
+        req.system_prompt += "\n原生技能可通过 native_skill_list 和 native_skill_read 读取当前允许的技能及配套文本，无需 Computer Use。这不提供脚本执行、安装或写入权限。使用技能前必须读完整 SKILL.md；分页读取须全部完成。"
         binding = event.get_extra(BINDING)
         if not binding or not req.conversation or req.conversation.cid != binding["topic"].cid:
             if req.func_tool:
-                for name in TOOLS:
+                for name in KNOWLEDGE_TOOLS:
                     req.func_tool.remove_tool(name)
             req.system_prompt += "\n知识管理不可用：没有可信引用话题绑定；不要声称已保存知识。"
             return
@@ -131,8 +150,6 @@ class SummaryWriteKnowledgeSkill(Star):
             if not isinstance(history, list):
                 raise KnowledgeError("话题历史格式不正确。")
             maximum = int(self.config.get("max_topic_chars", 100000))
-            if len(json.dumps(history, ensure_ascii=False)) > maximum:
-                raise KnowledgeError("话题历史超过整理上限，请拆分明确范围；本次不会静默截断保存。")
             raw = event.message_obj.raw_message
             parent = (
                 raw.get("parent_id", "") if isinstance(raw, dict) else getattr(raw, "parent_id", "")
@@ -152,6 +169,8 @@ class SummaryWriteKnowledgeSkill(Star):
                 raise KnowledgeError("消息缺少写入来源。")
             self.store.observe(topic)
             event.set_extra(SNAPSHOT, topic)
+            attachments = self.current_attachments(event)
+            event.set_extra("summary_knowledge.window", SourceWindow(topic, maximum, attachments))
             event.set_extra("summary_knowledge.read_ids", set())
             req.system_prompt += "\n" + SYSTEM
             req.system_prompt += "\n当前话题项目目录（数据）：" + json.dumps(
@@ -160,7 +179,7 @@ class SummaryWriteKnowledgeSkill(Star):
         except (KnowledgeError, ValueError, TypeError) as exc:
             event.set_extra("summary_knowledge.prepare_error", str(exc))
             if req.func_tool:
-                for name in TOOLS:
+                for name in KNOWLEDGE_TOOLS:
                     req.func_tool.remove_tool(name)
             req.system_prompt += "\n知识管理上下文不完整，请告知用户本次不能保存，原因：" + str(exc)
 
@@ -214,14 +233,158 @@ class SummaryWriteKnowledgeSkill(Star):
         finally:
             self.active.discard(task)
 
+    def current_attachments(self, event):
+        from astrbot.core.message.components import File
+        from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+
+        root = Path(get_astrbot_temp_path()).resolve()
+        result, notices = [], []
+        event.set_extra("summary_knowledge.attachment_notices", notices)
+        for component in event.message_obj.message:
+            if not isinstance(component, File) or Path(component.name or "").suffix.lower() not in {
+                ".md",
+                ".txt",
+            }:
+                continue
+            if len(result) >= 10:
+                notices.append("本次仅列出前 10 个文本附件，其余请分批发送。")
+                break
+            try:
+                # Paths originate only from this event's adapter-downloaded attachments.
+                path = Path(component.file_ or "")
+                if not path.is_absolute() or not path.resolve().is_relative_to(root):
+                    raise KnowledgeError("文本附件尚未下载到允许的临时目录，请重新附上或粘贴正文。")
+                data = read_text_resource(root, str(path.relative_to(root)), 0, 32000)
+                body = data["content"]
+                while data["next_offset"] is not None:
+                    more = read_text_resource(
+                        root, str(path.relative_to(root)), data["next_offset"], 32000
+                    )
+                    if more["sha256"] != data["sha256"]:
+                        raise KnowledgeError("附件在读取期间发生变化，请重新发送。")
+                    data = more
+                    body += data["content"]
+                result.append({"name": component.name, "text": body, "file_sha256": data["sha256"]})
+            except KnowledgeError as exc:
+                notices.append(str(exc))
+        return result
+
+    def skill_guard(self, event):
+        from astrbot import __version__
+
+        if (
+            not self.enabled(event)
+            or event.get_platform_name() != "lark"
+            or __version__ not in {"4.28.0", "4.28.1"}
+            or not event.get_extra("summary_knowledge.skill_ready")
+        ):
+            raise KnowledgeError("当前会话未启用技能读取。")
+
+    @filter.llm_tool(name="native_skill_list")
+    async def native_skill_list(self, event: AstrMessageEvent):
+        """列出当前人格和配置允许且已启用的本地原生技能；不安装、不执行。"""
+
+        async def action():
+            self.skill_guard(event)
+            skills = await available_skills(self.context, event)
+            return {
+                "status": "ok",
+                "skills": [{"name": s.name, "description": s.description} for s in skills],
+            }
+
+        return await self.run_tool(event, action)
+
+    @filter.llm_tool(name="native_skill_read")
+    async def native_skill_read(
+        self, event: AstrMessageEvent, name: str, path: str = "SKILL.md", offset: int = 0
+    ):
+        """读取允许使用的原生技能全文或配套文本，长文件按 next_offset 继续；不执行脚本。
+
+        Args:
+            name(string): native_skill_list 返回的技能名。
+            path(string): 技能内相对文本路径，默认 SKILL.md，不能传宿主绝对路径。
+            offset(int): 字符起点，首次为 0，后续使用 next_offset。
+        """
+
+        async def action():
+            self.skill_guard(event)
+            skills = [s for s in await available_skills(self.context, event) if s.name == name]
+            if len(skills) != 1:
+                raise KnowledgeError("技能不存在、未启用或当前人格无权使用。")
+            root = skill_root(skills[0])
+            result = read_text_resource(root, path, offset)
+            return {"status": "ok", "name": name, **result}
+
+        return await self.run_tool(event, action)
+
     @filter.llm_tool(name="knowledge_context")
-    async def knowledge_context(self, event: AstrMessageEvent):
-        """获取当前引用话题的完整已登记历史、来源限制、项目目录和当前版本；整理保存前必须调用。"""
+    async def knowledge_context(self, event: AstrMessageEvent, offset: int = 0):
+        """获取项目目录和来源目录；长话题需分页读取来源并明确选择整理范围，再保存。
+
+        Args:
+            offset(int): 来源目录分页起点，首次为 0，后续使用 next_offset。
+        """
 
         async def action():
             topic = self.guard(event)
+            window = event.get_extra("summary_knowledge.window")
             event.set_extra("summary_knowledge.context_read", True)
-            return {"topic": topic.to_dict(), **(await self.service.context_catalog(topic))}
+            shown = window.selected or replace(
+                topic,
+                history=[],
+                source_messages=[],
+                coverage="尚未选取来源，不能保存；请读取目录中的片段或本条消息附件。",
+            )
+            return {
+                "topic": shown.to_dict(),
+                "source_directory": window.directory(offset),
+                "attachment_notices": event.get_extra("summary_knowledge.attachment_notices", []),
+                **(await self.service.context_catalog(topic)),
+            }
+
+        return await self.run_tool(event, action)
+
+    @filter.llm_tool(name="knowledge_source_read")
+    async def knowledge_source_read(self, event: AstrMessageEvent, source_id: str, offset: int = 0):
+        """分页读取当前话题消息或当前消息已下载的 Markdown/TXT 附件，不接受任意文件路径。
+
+        Args:
+            source_id(string): knowledge_context 来源目录中的 ID。
+            offset(int): 字符起点，首次为 0，后续使用 next_offset。
+        """
+
+        async def action():
+            self.guard(event)
+            return event.get_extra("summary_knowledge.window").read(source_id, offset)
+
+        return await self.run_tool(event, action)
+
+    @filter.llm_tool(name="knowledge_source_select")
+    async def knowledge_source_select(
+        self, event: AstrMessageEvent, snapshot: str, ranges_json: str, reason: str
+    ):
+        """将已读取片段明确选为本次保存依据；范围要符合用户请求，不得跳过反对意见冒充最终结论。
+
+        Args:
+            snapshot(string): knowledge_context 返回的快照指纹。
+            ranges_json(string): JSON 数组，每项为来源 id 和字符 start/end，end 不包含自身。
+            reason(string): 选择依据及与用户要求的对应关系，不清楚时询问用户。
+        """
+
+        async def action():
+            self.guard(event, write=True)
+            if len(ranges_json) > 20000:
+                raise KnowledgeError("选取参数过长。")
+            try:
+                ranges = json.loads(ranges_json)
+            except ValueError:
+                raise KnowledgeError("来源范围不是有效 JSON。") from None
+            selected = event.get_extra("summary_knowledge.window").select(snapshot, ranges, reason)
+            return {
+                "status": "selected",
+                "coverage": selected.coverage,
+                "selection": selected.selection,
+            }
 
         return await self.run_tool(event, action)
 
@@ -292,11 +455,27 @@ class SummaryWriteKnowledgeSkill(Star):
                 "summary_knowledge.read_ids", set()
             ):
                 raise KnowledgeError("修改前必须调用 knowledge_read 读取当前全文。")
+            window = event.get_extra("summary_knowledge.window")
+            topic = window.selected
+            if topic is None:
+                raise KnowledgeError(
+                    "本次尚未选择来源。请读取所需消息或附件，再调用 knowledge_source_select；不会静默截断整个话题。"
+                )
             provider = await self.context.get_using_provider_async(event.unified_msg_origin)
 
             async def review(topic, plan, old, catalog):
                 result = await self.review_with(provider, topic, plan, old, catalog)
                 self.guard(event, write=True)
+                if window.selected is not topic:
+                    raise KnowledgeError("校验期间来源范围发生变化，请重新保存。")
+                if result.get("allow") is True and topic.selection:
+                    write_atomic(
+                        self.store.root / "source-snapshots" / f"{window.snapshot}.json",
+                        json.dumps(
+                            {"topic": window.topic.to_dict(), "sources": window.sources},
+                            ensure_ascii=False,
+                        ),
+                    )
                 return result
 
             result = await self.service.save(topic, plan, review)
