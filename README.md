@@ -26,7 +26,7 @@ Agent 读取话题与项目目录，整理内容，判断保存类型，并由�
 
 ## 安装与配置
 
-要求 AstrBot **4.28.0**、Python **3.12+**、飞书内置 Agent，以及已经启用的引用续聊插件 `astrbot_plugin_quote_topics`（v1 绑定约定，基于 0.3.0 源码验证）。无需飞书卡片插件。
+要求 AstrBot **4.28.0 / 4.28.1**、Python **3.12+**、飞书内置 Agent，以及已经启用的引用续聊插件 `astrbot_plugin_quote_topics`（v1 绑定约定，基于 0.3.0 源码验证）。无需飞书卡片插件。
 
 通过 AstrBot 后台“从文件安装”安装开发包，或在隔离测试环境将本目录放入 `data/plugins/astrbot_plugin_summary_write_knowledge_skill`。开发包不是市场发布包。
 

@@ -79,8 +79,8 @@ class SummaryWriteKnowledgeSkill(Star):
     def guard(self, event, write=False):
         from astrbot import __version__
 
-        if __version__ != "4.28.0" or event.get_platform_name() != "lark":
-            raise KnowledgeError("本插件仅验证 AstrBot 4.28.0 飞书内置 Agent。")
+        if __version__ not in {"4.28.0", "4.28.1"} or event.get_platform_name() != "lark":
+            raise KnowledgeError("本插件仅验证 AstrBot 4.28.0 / 4.28.1 飞书内置 Agent。")
         if not self.enabled(event):
             raise KnowledgeError("当前会话未启用知识管理。")
         if (

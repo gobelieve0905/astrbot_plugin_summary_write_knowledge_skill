@@ -5,6 +5,6 @@ desc: 根据引用话题整理长期知识，按项目与平台管理版本，�
 version: 0.0.0
 author: gobelieve
 category: 工具
-astrbot_version: '>=4.28.0,<4.28.1'
+astrbot_version: '>=4.28.0,<4.28.2'
 support_platforms:
   - lark
