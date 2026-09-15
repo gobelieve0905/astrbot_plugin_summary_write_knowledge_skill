@@ -344,6 +344,20 @@ async def main():
             await plugin.knowledge_save_status(existing_evt, replaced["task_id"])
         )
         assert saved_status["status"] == "saved", saved_status
+        retry_plan = {**existing_plan, "title": "持久来源重试测试"}
+        chat.text_chat.return_value = types.SimpleNamespace(completion_text="not JSON")
+        failed_task = json.loads(await plugin.knowledge_save(existing_evt, json.dumps(retry_plan)))
+        assert failed_task["status"] == "needs_attention", failed_task
+        chat.text_chat.return_value = types.SimpleNamespace(
+            completion_text='{"allow":true,"explicit_project":true}'
+        )
+        retry_event = event("retry-without-new-selection")
+        await prepare(retry_event)
+        retry_event.get_extra("summary_knowledge.window").selected = None
+        retry_event.set_extra("summary_knowledge.context_read", False)
+        resumed = json.loads(await plugin.knowledge_save_retry(retry_event, failed_task["task_id"]))
+        assert resumed["status"] == "saved", resumed
+        assert resumed["task_id"] == failed_task["task_id"]
         # Changing the allowlist applies to catalog, reads and searches for existing bindings.
         plugin.service.backend.config["template_kb"] = "Idol Empire"
         restricted = json.loads(await plugin.knowledge_context(existing_evt))

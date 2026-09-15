@@ -65,3 +65,16 @@ class SaveJobsTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await asyncio.gather(*self.service.jobs.values())
         self.assertEqual(self.service.status(topic())[0]["status"], "saved")
+
+    async def test_source_survives_reload_and_is_scope_bound(self):
+        original = topic()
+        self.service.remember_source(
+            original, plan(), [{"record_id": "example", "content": "read evidence"}]
+        )
+        restarted = service_mod.Service(self.store, self.backend, {})
+        saved, evidence = restarted.restore_source(topic(mid="new message"), plan())
+        self.assertEqual(saved.message_id, original.message_id)
+        self.assertEqual(evidence[0]["content"], "read evidence")
+        self.assertIsNone(restarted.restore_source(topic(actor="bob"), plan()))
+        self.assertIsNone(restarted.restore_source(topic(cid="different"), plan()))
+        self.assertIsNone(restarted.restore_source(topic(), plan(content="changed")))

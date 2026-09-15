@@ -46,6 +46,9 @@ class Service:
         store.db.execute(
             "CREATE TABLE IF NOT EXISTS save_jobs(id TEXT PRIMARY KEY, scope TEXT, cid TEXT, actor TEXT, state TEXT, detail TEXT, updated TEXT, plan TEXT)"
         )
+        store.db.execute(
+            "CREATE TABLE IF NOT EXISTS save_sources(id TEXT PRIMARY KEY, topic TEXT NOT NULL, evidence TEXT NOT NULL)"
+        )
         with store.db:
             store.db.execute(
                 "UPDATE save_jobs SET state='interrupted', detail=? WHERE state IN ('queued','reviewing','writing','indexing')",
@@ -103,6 +106,36 @@ class Service:
             ).fetchone()
             is not None
         )
+
+    def remember_source(self, topic, plan, evidence, operation_key=""):
+        ident = self.task_id(topic, plan, operation_key)
+        with self.store.db:
+            self.store.db.execute(
+                "INSERT OR IGNORE INTO save_sources VALUES(?,?,?)",
+                (
+                    ident,
+                    json.dumps(topic.to_dict(), ensure_ascii=False),
+                    json.dumps(evidence, ensure_ascii=False),
+                ),
+            )
+
+    def restore_source(self, current, plan, operation_key=""):
+        ident = self.task_id(current, plan, operation_key)
+        row = self.store.db.execute(
+            "SELECT topic,evidence FROM save_sources WHERE id=?", (ident,)
+        ).fetchone()
+        if row is None:
+            return None
+        from .models import TopicContext
+
+        original = TopicContext(**json.loads(row["topic"]))
+        if (original.scope, original.cid, original.actor) != (
+            current.scope,
+            current.cid,
+            current.actor,
+        ):
+            raise KnowledgeError("原任务来源不属于当前用户和话题。")
+        return original, json.loads(row["evidence"])
 
     async def submit(self, topic, plan, review, operation_key="", wait_seconds=15):
         ident = self.task_id(topic, plan, operation_key)

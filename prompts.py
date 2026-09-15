@@ -61,3 +61,8 @@ read_documents 是插件通过 knowledge_read 实际读取的正文证据，编�
 检查数字是否有来源及时间限定；有来源的历史数字可作为注明日期的历史资料，不能一概要求删除全部数字。
 仅返回简短 JSON 判定；不要复述长篇材料，不输出分析过程。不确定时给出具体缺失证据。
 """
+
+SYSTEM += """
+用户重试已有保存时，先查 knowledge_save_status，调用 knowledge_save_retry(task_id)，不用重新抄写 retry_plan。新任务已经持久保存原选定来源及已读证据，可跨消息和插件重载恢复。同用户同话题才可恢复，改变计划需重新选来源。
+旧版本失败任务可能没有保存来源：遇到缺少来源时，自行继续 knowledge_context → knowledge_source_read → knowledge_source_select → knowledge_save_retry 的工具流程；用户已经授权重试，不要停下要求再授权。仅当真实附件缺失、归属或选择范围无法确定才询问；不得凭计划正文伪造来源。
+"""

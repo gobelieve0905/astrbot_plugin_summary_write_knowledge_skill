@@ -32,6 +32,7 @@ KNOWLEDGE_TOOLS = (
     "knowledge_read",
     "knowledge_save",
     "knowledge_save_status",
+    "knowledge_save_retry",
     "knowledge_source_read",
     "knowledge_source_select",
     "knowledge_artifact_import",
@@ -1126,6 +1127,32 @@ class SummaryWriteKnowledgeSkill(Star):
 
         return await self.run_tool(event, action)
 
+    @filter.llm_tool(name="knowledge_save_retry")
+    async def knowledge_save_retry(self, event: AstrMessageEvent, task_id: str):
+        """用户要求重试时，按任务编号恢复原计划及来源，不重新抄写正文。旧任务缺少来源时继续读取/选择工具流程，不要求用户重复授权。
+
+        Args:
+            task_id(string): knowledge_save_status 返回的任务编号。
+        """
+
+        async def action():
+            current = self.guard(event, write=True)
+            result = self.service.status(current, task_id)
+            if result["status"] == "saved":
+                return json.loads(await self.knowledge_save_status(event, task_id))
+            row = self.store.db.execute(
+                "SELECT plan FROM save_jobs WHERE id=?", (task_id,)
+            ).fetchone()
+            plan = Plan.parse(json.loads(row["plan"]))
+            # Only standalone tasks here; paired delivery keys must use knowledge_delivery.
+            if self.service.task_id(current, plan) != task_id:
+                raise KnowledgeError("这是组合交付任务，请使用 knowledge_delivery resume。")
+            return json.loads(
+                await self.knowledge_save(event, json.dumps(plan.to_dict(), ensure_ascii=False))
+            )
+
+        return await self.run_tool(event, action)
+
     @filter.llm_tool(name="knowledge_save")
     async def knowledge_save(self, event: AstrMessageEvent, plan_json: str):
         """用户明确要求长期保存时，校验并写入一个知识/规则/项目 Skill，更新索引并验证；只有 status=saved 才能回复已保存。
@@ -1138,8 +1165,6 @@ class SummaryWriteKnowledgeSkill(Star):
 
         async def action():
             topic = self.guard(event, write=True)
-            if not event.get_extra("summary_knowledge.context_read"):
-                raise KnowledgeError("请先调用 knowledge_context 读取话题与目录，再整理保存。")
             if len(plan_json) > 40000:
                 raise KnowledgeError("单条知识过长，请拆分。")
             try:
@@ -1156,7 +1181,15 @@ class SummaryWriteKnowledgeSkill(Star):
             ):
                 raise KnowledgeError("修改前必须调用 knowledge_read 读取当前全文。")
             window = event.get_extra("summary_knowledge.window")
-            topic = window.selected
+            current = topic
+            restored = self.service.restore_source(
+                current, plan, event.get_extra("summary_knowledge.delivery_key", "")
+            )
+            if not restored and not event.get_extra("summary_knowledge.context_read"):
+                raise KnowledgeError(
+                    "首次保存请先读取 knowledge_context，再读取和选择来源；请继续工具流程。"
+                )
+            topic = restored[0] if restored else window.selected
             if topic is None:
                 raise KnowledgeError(
                     "本次尚未选择来源。请读取所需消息或附件，再调用 knowledge_source_select；不会静默截断整个话题。"
@@ -1171,17 +1204,35 @@ class SummaryWriteKnowledgeSkill(Star):
                     ensure_ascii=False,
                 )
             )
+            if restored:
+                # Retain original evidence; newly read documents supersede matching references.
+                evidence = list({d["record_id"]: d for d in restored[1] + evidence}.values())
             if sum(len(item.get("content", "")) for item in evidence) > 200000:
                 raise KnowledgeError(
                     "本轮已读旧文档过多，请在新一轮聚焦相关文档后保存；不会截断证据。"
                 )
 
+            self.service.remember_source(
+                topic, plan, evidence, event.get_extra("summary_knowledge.delivery_key", "")
+            )
+
             async def review(topic, plan, old, catalog):
-                result = await self.review_with(provider, topic, plan, old, catalog, evidence)
+                review_topic = (
+                    replace(
+                        topic,
+                        request=current.request,
+                        selection={**topic.selection, "retry_original_request": topic.request},
+                    )
+                    if restored
+                    else topic
+                )
+                result = await self.review_with(
+                    provider, review_topic, plan, old, catalog, evidence
+                )
                 self.guard(event, write=True)
-                if window.selected is not topic:
+                if not restored and window.selected is not topic:
                     raise KnowledgeError("校验期间来源范围发生变化，请重新保存。")
-                if result.get("allow") is True and topic.selection:
+                if result.get("allow") is True and topic.selection and not restored:
                     write_atomic(
                         self.store.root / "source-snapshots" / f"{window.snapshot}.json",
                         json.dumps(
