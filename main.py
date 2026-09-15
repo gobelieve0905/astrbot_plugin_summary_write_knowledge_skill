@@ -218,20 +218,36 @@ class SummaryWriteKnowledgeSkill(Star):
                     req.func_tool.remove_tool(name)
             req.system_prompt += "\n知识管理上下文不完整，请告知用户本次不能保存，原因：" + str(exc)
 
-    async def review_with(self, provider, topic, plan, old, catalog):
+    async def review_with(self, provider, topic, plan, old, catalog, read_documents=None):
         if provider is None:
             raise KnowledgeError("当前聊天模型不可用，未执行写入。")
         payload = {
             "topic": topic.to_dict(),
             "plan": plan.to_dict(),
-            "catalog": catalog,
+            "catalog": {
+                "bound_project": catalog.get("bound_project"),
+                "knowledge_bases": catalog.get("knowledge_bases", []),
+                "target_documents": catalog.get("target_documents", []),
+                "projects": [
+                    {
+                        **p,
+                        "records": [
+                            {k: v for k, v in r.items() if k != "retry_plan"}
+                            for r in p.get("records", [])
+                        ],
+                    }
+                    for p in catalog.get("projects", [])
+                    if p["name"] == plan.project
+                ],
+            },
+            "read_documents": read_documents or [],
             "previous": json.loads(old["plan"]) if old else None,
         }
         result = await asyncio.wait_for(
             provider.text_chat(
                 prompt=json.dumps(payload, ensure_ascii=False), system_prompt=REVIEW, contexts=[]
             ),
-            timeout=int(self.config.get("review_timeout", 120)),
+            timeout=max(1, int(self.config.get("knowledge_review_timeout", 300))),
         )
         raw = result.completion_text.strip()
         if raw.startswith("```json") and raw.endswith("```"):
@@ -1062,6 +1078,23 @@ class SummaryWriteKnowledgeSkill(Star):
             topic = self.guard(event)
             result = await self.service.read(topic, record_id, platform)
             event.get_extra("summary_knowledge.read_ids").add(record_id)
+            evidence = event.get_extra("summary_knowledge.read_documents", {})
+            evidence[record_id] = {
+                k: result[k]
+                for k in (
+                    "record_id",
+                    "project",
+                    "knowledge_base",
+                    "platform",
+                    "version",
+                    "sha256",
+                    "content",
+                    "content_kind",
+                    "complete",
+                )
+                if k in result
+            }
+            event.set_extra("summary_knowledge.read_documents", evidence)
             return result
 
         return await self.run_tool(event, action)
@@ -1130,8 +1163,21 @@ class SummaryWriteKnowledgeSkill(Star):
                 )
             provider = await self.context.get_using_provider_async(event.unified_msg_origin)
 
+            # Capture trusted tool-read evidence before starting the background task.
+            # Do not call Service.read inside review: Service.save holds its write lock.
+            evidence = json.loads(
+                json.dumps(
+                    list(event.get_extra("summary_knowledge.read_documents", {}).values()),
+                    ensure_ascii=False,
+                )
+            )
+            if sum(len(item.get("content", "")) for item in evidence) > 200000:
+                raise KnowledgeError(
+                    "本轮已读旧文档过多，请在新一轮聚焦相关文档后保存；不会截断证据。"
+                )
+
             async def review(topic, plan, old, catalog):
-                result = await self.review_with(provider, topic, plan, old, catalog)
+                result = await self.review_with(provider, topic, plan, old, catalog, evidence)
                 self.guard(event, write=True)
                 if window.selected is not topic:
                     raise KnowledgeError("校验期间来源范围发生变化，请重新保存。")

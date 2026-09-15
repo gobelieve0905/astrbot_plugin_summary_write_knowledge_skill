@@ -303,6 +303,13 @@ async def main():
             await plugin.knowledge_save(existing_evt, json.dumps(existing_plan))
         )
         assert existing_result["status"] == "saved", existing_result
+        evidence_payload = json.loads(chat.text_chat.call_args.kwargs["prompt"])
+        assert any(
+            d["record_id"] == ref and "original material" in d["content"]
+            for d in evidence_payload["read_documents"]
+        ), evidence_payload.keys()
+        assert evidence_payload["catalog"]["target_documents"]
+
         assert plugin.store.project("Existing project")["kb_id"] == existing.kb.kb_id
         assert await existing.get_document(original.doc_id) is not None
         assert (

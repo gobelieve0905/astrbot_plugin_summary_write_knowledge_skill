@@ -66,7 +66,13 @@
   "review_timeout": {
     "type": "int",
     "default": 120,
-    "description": "写入校验超时（秒）",
-    "hint": "默认 120 秒。使用当前聊天模型校验保存意图和内容；超时不会确认保存成功。"
+    "description": "技能校验超时（秒）",
+    "hint": "团队技能校验使用当前聊天模型，默认 120 秒。知识写入使用下方独立超时配置。"
+  },
+  "knowledge_review_timeout": {
+    "type": "int",
+    "default": 300,
+    "description": "知识审核超时（秒）",
+    "hint": "默认 300 秒。后台审核完整选定来源和已读文档，15 秒后先返回任务编号；超时明确失败，不绕过校验。"
   }
 }
